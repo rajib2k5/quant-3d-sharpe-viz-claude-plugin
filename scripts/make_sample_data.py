@@ -24,10 +24,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from fetch_data import SAMPLE_DIR
+from fetch_data import PRICE_PART, SAMPLE_DIR, write_price_parts
 
 SEED = 20260101
 N_PRICE_ROWS = 1301
+TICKERS_PER_PART = 15  # prices-1.csv ... prices-4.csv, about 165 KB each
+MAX_PART_BYTES = 200 * 1024
 END_DATE = "2025-12-31"
 RF_ANNUAL = 0.04
 TRADING_DAYS = 252
@@ -112,7 +114,14 @@ def main(argv: list[str] | None = None) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     frames = build()
     frames["universe"].to_csv(args.out_dir / "universe.csv", index=False)
-    for name in ("prices", "risk_free", "factors"):
+    # Remove an older single prices.csv or leftover parts, which would clash with the new parts.
+    for stale in args.out_dir.glob("prices*.csv"):
+        if stale.name == "prices.csv" or PRICE_PART.fullmatch(stale.name):
+            stale.unlink()
+    for part in write_price_parts(frames["prices"], args.out_dir, TICKERS_PER_PART):
+        if part.stat().st_size >= MAX_PART_BYTES:
+            raise SystemExit(f"error: {part} is {part.stat().st_size} bytes; lower TICKERS_PER_PART")
+    for name in ("risk_free", "factors"):
         frames[name].to_csv(args.out_dir / f"{name}.csv", index_label="date")
     print(f"wrote {len(frames['universe'])} tickers x {len(frames['prices'])} rows to {args.out_dir}")
     return 0

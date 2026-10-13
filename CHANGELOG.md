@@ -43,4 +43,6 @@ Initial release. Nothing was published before this version, so all development t
 ### Plugin
 - Two skills: `sharpe-screen` and `sharpe-skyline`.
 - A self-hosted marketplace (`quant-3d-sharpe-viz`).
-- Privacy policy (PRIVACY.md), support guide (SUPPORT.md), and a generated icon (`scripts/make_icon.py`).
+- Privacy policy (PRIVACY.md), support guide (SUPPORT.md), and a generated icon (`scripts/make_icon.py`), also installed as the listing icon at `.claude-plugin/icon.png`.
+- No environment variables are read: the Blender binary is found with `--blender PATH` or on PATH.
+- The bundled sample prices ship as `data/sample/prices-1.csv` … `prices-4.csv` (each under 200 KiB); `load_directory` joins the parts and still accepts a single `prices.csv`.

@@ -1,8 +1,9 @@
 """Draw the plugin icon: a dark rounded tile with a small skyline and the red luck plane.
 
-Usage: python make_icon.py [--out-dir assets/]
+Usage: python make_icon.py [--out-dir assets/] [--plugin-icon .claude-plugin/icon.png]
 
-Writes icon-512.png and icon-128.png. The towers use the same gray -> blue -> gold alpha
+Writes icon-512.png and icon-128.png, plus a byte copy of icon-512.png at .claude-plugin/icon.png,
+where the plugin directory looks for the icon. The towers use the same gray -> blue -> gold alpha
 t-statistic ramp as the scenes (skyline_common.t_stat_color); the tallest, gold tower pierces
 the translucent red plane. Output is deterministic: same bytes on every run.
 """
@@ -10,6 +11,7 @@ the translucent red plane. Output is deterministic: same bytes on every run.
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -84,8 +86,13 @@ def write_icons(out_dir: Path) -> list[Path]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Write the plugin icon PNGs.")
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "assets")
+    parser.add_argument("--plugin-icon", type=Path, default=REPO_ROOT / ".claude-plugin" / "icon.png",
+                        help="where to copy icon-512.png for the plugin directory")
     args = parser.parse_args(argv)
-    for path in write_icons(args.out_dir):
+    written = write_icons(args.out_dir)
+    args.plugin_icon.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(written[SIZES.index(512)], args.plugin_icon)
+    for path in [*written, args.plugin_icon]:
         print(f"wrote {path}")
     return 0
 

@@ -24,9 +24,10 @@ This renders `out/skyline.png` and also writes the interactive three.js page `ou
 
 The PNG renderer is chosen automatically, best first:
 
-1. **bpy module** in the current interpreter (Blender's Cycles engine, 64 samples, 1600x1000).
-2. **Blender binary** (`--blender PATH`, `$SHARPE_OBSERVATORY_BLENDER` or `blender` on PATH), run headless.
-3. **matplotlib** (`scene_python.py`), which is in requirements.txt and always works; it renders in under a second.
+1. **`--blender PATH`**, when given: that Blender binary, run headless.
+2. **bpy module** in the current interpreter (Blender's Cycles engine, 64 samples, 1600x1000).
+3. **`blender` on PATH**, run headless.
+4. **matplotlib** (`scene_python.py`), which is in requirements.txt and always works; it renders in under a second.
 
 A tier that is missing or fails is noted on stderr and the next one is used. The only hard failure is a missing matplotlib (`error: matplotlib is not installed; run pip install -r requirements.txt`). To skip the tier search and use matplotlib directly:
 

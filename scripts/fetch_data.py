@@ -12,7 +12,9 @@ Live sources (contacted only in live mode):
 
 Every source is normalized to the on-disk format of data/sample/:
 - universe.csv     ticker, sector
-- prices.csv       date, <ticker>... (closes adjusted for splits and dividends)
+- prices.csv       date, <ticker>... (closes adjusted for splits and dividends), or the same
+                   table split by ticker columns into prices-1.csv, prices-2.csv, ... (the
+                   committed sample is split so no file exceeds 200 KiB)
 - risk_free.csv    date, rf_daily (decimal per trading day)
 - factors.csv      date, mkt_rf, smb, hml (decimal per trading day)
 """
@@ -58,6 +60,7 @@ TICKER_COLUMNS = ("ticker", "Ticker", "Symbol", "symbol")
 SECTOR_COLUMNS = ("sector", "Sector", "GICS Sector", "gics_sector")
 WEBSITE_COLUMNS = ("website", "Website")
 FACTOR_COLUMNS = ["mkt_rf", "smb", "hml"]
+PRICE_PART = re.compile(r"prices-(\d+)\.csv")
 
 
 @dataclass(frozen=True)
@@ -247,10 +250,43 @@ def clean_prices(prices: pd.DataFrame) -> pd.DataFrame:
     return prices.mask(bad)
 
 
+def read_prices(data_dir: Path) -> pd.DataFrame:
+    """prices.csv, or the parts prices-1.csv ... prices-K.csv joined column-wise in part order."""
+    single = data_dir / "prices.csv"
+    parts = sorted((int(m.group(1)), path) for path in data_dir.glob("prices-*.csv")
+                   if (m := PRICE_PART.fullmatch(path.name)))
+    if single.is_file():
+        if parts:
+            raise ValueError(f"{data_dir} has both prices.csv and prices-N.csv parts; keep one form")
+        return pd.read_csv(single, index_col="date", parse_dates=["date"])
+    if not parts:
+        raise FileNotFoundError(f"{data_dir} has neither prices.csv nor prices-1.csv, prices-2.csv, ...")
+    if [number for number, _ in parts] != list(range(1, len(parts) + 1)):
+        raise ValueError(f"price parts in {data_dir} are not numbered 1..{len(parts)}: {[p.name for _, p in parts]}")
+    frames = [pd.read_csv(path, index_col="date", parse_dates=["date"]) for _, path in parts]
+    for (_, path), frame in zip(parts[1:], frames[1:]):
+        if not frame.index.equals(frames[0].index):
+            raise ValueError(f"{path.name} has different dates from {parts[0][1].name}")
+    prices = pd.concat(frames, axis=1)
+    if prices.columns.duplicated().any():
+        raise ValueError(f"tickers appear in more than one price part: {sorted(set(prices.columns[prices.columns.duplicated()]))}")
+    return prices
+
+
+def write_price_parts(prices: pd.DataFrame, out_dir: Path, tickers_per_part: int) -> list[Path]:
+    """Write ``prices`` as prices-1.csv, prices-2.csv, ... with ``tickers_per_part`` columns each."""
+    written = []
+    for start in range(0, len(prices.columns), tickers_per_part):
+        path = out_dir / f"prices-{len(written) + 1}.csv"
+        prices.iloc[:, start:start + tickers_per_part].to_csv(path, index_label="date")
+        written.append(path)
+    return written
+
+
 def load_directory(data_dir: Path, universe_path: Path | None = None) -> Dataset:
     """Load a dataset previously written in the sample format (no network)."""
     universe = load_universe(universe_path or data_dir / "universe.csv")
-    prices = pd.read_csv(data_dir / "prices.csv", index_col="date", parse_dates=["date"]).sort_index()
+    prices = read_prices(data_dir).sort_index()
     rf = pd.read_csv(data_dir / "risk_free.csv", index_col="date", parse_dates=["date"])["rf_daily"].sort_index()
     factors = pd.read_csv(data_dir / "factors.csv", index_col="date", parse_dates=["date"])[FACTOR_COLUMNS].sort_index()
     present = [t for t in universe["ticker"] if t in prices.columns]

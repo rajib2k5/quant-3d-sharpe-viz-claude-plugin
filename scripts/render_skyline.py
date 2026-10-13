@@ -3,13 +3,13 @@
 Usage: python render_skyline.py out/screen_result.json [--out out/skyline.png] [--blender PATH]
                                 [--html [PATH]] [--open]
 
-Tiers, in order:
-1. The ``bpy`` module (``pip install bpy``) importable in this interpreter: the Blender scene
+Renderers, in order:
+1. ``--blender PATH``, when given: that Blender binary (the bpy module is not tried).
+2. The ``bpy`` module (``pip install bpy``) importable in this interpreter: the Blender scene
    script from scene_blender.py runs in-process as if launched with ``-- --render PATH``.
-   Skipped when ``--blender`` is given.
-2. A Blender binary: ``--blender PATH``, else $SHARPE_OBSERVATORY_BLENDER, else ``blender`` on
-   PATH, run as ``blender -b --factory-startup --python SCRIPT --python-exit-code 1 -- --render PATH``.
-3. matplotlib (scene_python.py), which needs no Blender at all.
+3. ``blender`` on PATH. Binaries run as
+   ``blender -b --factory-startup --python SCRIPT --python-exit-code 1 -- --render PATH``.
+4. matplotlib (scene_python.py), which needs no Blender at all.
 A tier that is unavailable or fails is reported on stderr and the next one is tried; only a
 missing matplotlib at tier 3 is fatal. The Blender tiers also leave the generated script next
 to the PNG as skyline_bpy.py. ``--html`` also writes the interactive three.js page
@@ -19,7 +19,6 @@ to the PNG as skyline_bpy.py. ``--html`` also writes the interactive three.js pa
 from __future__ import annotations
 
 import argparse
-import os
 import runpy
 import shutil
 import subprocess
@@ -30,7 +29,6 @@ import scene_threejs
 from scene_blender import render_script
 from skyline_common import build_scene, load_result
 
-ENV_VAR = "SHARPE_OBSERVATORY_BLENDER"
 TIMEOUT_S = 600
 TAIL_LINES = 12
 
@@ -55,11 +53,9 @@ def _resolve_binary(candidate: str, origin: str) -> str:
 
 
 def find_blender(explicit: str | None) -> str | None:
-    """The Blender binary to use: --blender, then $SHARPE_OBSERVATORY_BLENDER, then PATH."""
+    """The Blender binary to use: the --blender path when given, else ``blender`` on PATH."""
     if explicit:
         return _resolve_binary(explicit, "--blender")
-    if os.environ.get(ENV_VAR):
-        return _resolve_binary(os.environ[ENV_VAR], f"${ENV_VAR}")
     return shutil.which("blender")
 
 

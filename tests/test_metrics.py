@@ -961,7 +961,7 @@ def test_threejs_open_flag(screen_runs: tuple[Path, Path], monkeypatch: pytest.M
 
 
 def test_render_skyline_html_and_open(screen_runs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-                                      no_bpy: None, no_blender: None, capsys: pytest.CaptureFixture[str]):
+                                      no_bpy: None, fake_tools: dict[str, str], capsys: pytest.CaptureFixture[str]):
     opened: list[str] = []
     monkeypatch.setattr(scene_threejs.webbrowser, "open", opened.append)
     src = str(screen_runs[0] / "screen_result.json")
@@ -1019,26 +1019,27 @@ with open(args[1], "w") as fh:
 """
 
 
-def _fake_blender(directory: Path, name: str, exit_code: int = 0, write_png: bool = True) -> Path:
-    """An executable standing in for Blender: logs its argv, optionally writes the PNG."""
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / name
-    path.write_text(
-        f"#!{sys.executable}\n"
-        "import json, sys\n"
-        f"open({str(directory / (name + '.argv'))!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
-        f"if {write_png!r}:\n"
-        "    open(sys.argv[sys.argv.index('--render') + 1], 'w').write('binary:' + sys.argv[0])\n"
-        f"if {exit_code}:\n"
-        "    sys.stderr.write('Error: Python script failed\\nTraceback line one\\nKeyError: boom\\n')\n"
-        f"sys.exit({exit_code})\n"
-    )
-    path.chmod(0o755)
-    return path
+class FakeBlender:
+    """Stands in for running a Blender binary: render_skyline's subprocess.run is replaced by this,
+    which records each command and optionally writes the PNG named after --render."""
+
+    def __init__(self, exit_code: int = 0, write_png: bool = True) -> None:
+        self.exit_code, self.write_png, self.calls = exit_code, write_png, []
+
+    def __call__(self, command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.calls.append(command)
+        if self.write_png:
+            Path(command[command.index("--render") + 1]).write_text("binary:" + command[0])
+        stderr = "Error: Python script failed\nTraceback line one\nKeyError: boom\n" if self.exit_code else ""
+        return subprocess.CompletedProcess(command, self.exit_code, stdout="", stderr=stderr)
 
 
-def _recorded_argv(binary: Path) -> list[str]:
-    return json.loads(binary.with_name(binary.name + ".argv").read_text())
+@pytest.fixture
+def fake_tools(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Binaries render_skyline can find: name -> resolved path (stands in for shutil.which)."""
+    tools: dict[str, str] = {}
+    monkeypatch.setattr(render_skyline.shutil, "which", lambda name: tools.get(name))
+    return tools
 
 
 @pytest.fixture
@@ -1046,16 +1047,8 @@ def no_bpy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "bpy", None)  # makes `import bpy` raise ImportError
 
 
-@pytest.fixture
-def no_blender(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    empty = tmp_path / "empty-path"
-    empty.mkdir()
-    monkeypatch.setenv("PATH", str(empty))
-    monkeypatch.delenv("SHARPE_OBSERVATORY_BLENDER", raising=False)
-
-
 def test_render_tier1_bpy_module(screen_runs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-                                 capsys: pytest.CaptureFixture[str]):
+                                 fake_tools: dict[str, str], capsys: pytest.CaptureFixture[str]):
     stub = types.ModuleType("bpy")
     stub.IS_STUB = True  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "bpy", stub)
@@ -1065,13 +1058,14 @@ def test_render_tier1_bpy_module(screen_runs: tuple[Path, Path], monkeypatch: py
         return script
 
     monkeypatch.setattr(render_skyline, "write_bpy_script", fake_script)
-    binary = _fake_blender(tmp_path / "bin", "blender")
-    monkeypatch.setenv("PATH", str(binary.parent))
+    blender = FakeBlender()
+    monkeypatch.setattr(render_skyline.subprocess, "run", blender)
+    fake_tools["blender"] = "/usr/bin/blender"  # present on PATH, but bpy must win
     png = tmp_path / "out" / "sky.png"
     argv_before = list(sys.argv)
     assert render_skyline.main([str(screen_runs[0] / "screen_result.json"), "--out", str(png)]) == 0
     assert png.read_text() == f"in-process pid={os.getpid()} stub=True"
-    assert not binary.with_name("blender.argv").exists()
+    assert blender.calls == []
     assert sys.argv == argv_before
     captured = capsys.readouterr()
     assert captured.out.strip() == str(png.resolve())
@@ -1079,27 +1073,45 @@ def test_render_tier1_bpy_module(screen_runs: tuple[Path, Path], monkeypatch: py
 
 
 def test_render_tier2_blender_binary(screen_runs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-                                     no_bpy: None):
+                                     no_bpy: None, fake_tools: dict[str, str]):
     src = screen_runs[0] / "screen_result.json"
-    on_path = _fake_blender(tmp_path / "path", "blender")
-    from_env = _fake_blender(tmp_path / "env", "blender-env")
-    explicit = _fake_blender(tmp_path / "explicit", "blender-flag")
+    blender = FakeBlender()
+    monkeypatch.setattr(render_skyline.subprocess, "run", blender)
+    fake_tools["blender"] = "/usr/bin/blender"
+    fake_tools["/opt/blender-4/blender"] = "/opt/blender-4/blender"
     png = tmp_path / "sky.png"
     script = (tmp_path / "skyline_bpy.py").resolve()
-    monkeypatch.setenv("PATH", str(on_path.parent))
-    monkeypatch.delenv("SHARPE_OBSERVATORY_BLENDER", raising=False)
 
-    assert render_skyline.render(src, png) == f"tier 2 (blender binary {on_path})"
-    assert _recorded_argv(on_path) == ["-b", "--factory-startup", "--python", str(script),
-                                       "--python-exit-code", "1", "--", "--render", str(png.resolve())]
+    assert render_skyline.render(src, png) == "tier 2 (blender binary /usr/bin/blender)"
+    assert blender.calls[-1] == ["/usr/bin/blender", "-b", "--factory-startup", "--python", str(script),
+                                 "--python-exit-code", "1", "--", "--render", str(png.resolve())]
     assert script.read_text().startswith("# Sharpe Observatory skyline: generated by scene_blender.py.")
-    monkeypatch.setenv("SHARPE_OBSERVATORY_BLENDER", str(from_env))
-    assert render_skyline.render(src, png) == f"tier 2 (blender binary {from_env})"
-    assert render_skyline.render(src, png, str(explicit)) == f"tier 2 (blender binary {explicit})"
-    assert png.read_text() == f"binary:{explicit}"
+    assert render_skyline.render(src, png, "/opt/blender-4/blender") == "tier 2 (blender binary /opt/blender-4/blender)"
+    assert png.read_text() == "binary:/opt/blender-4/blender"
 
 
-def test_render_tier3_matplotlib(screen_runs: tuple[Path, Path], tmp_path: Path, no_bpy: None, no_blender: None,
+def test_render_explicit_blender_skips_bpy(screen_runs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+                                           tmp_path: Path, fake_tools: dict[str, str]):
+    stub = types.ModuleType("bpy")
+    stub.IS_STUB = True  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "bpy", stub)  # a working bpy tier, but --blender takes precedence
+
+    def fake_script(result: Path, script: Path) -> Path:
+        script.write_text(FAKE_SCENE)
+        return script
+
+    monkeypatch.setattr(render_skyline, "write_bpy_script", fake_script)
+    blender = FakeBlender()
+    monkeypatch.setattr(render_skyline.subprocess, "run", blender)
+    fake_tools["/opt/blender-4/blender"] = "/opt/blender-4/blender"
+    png = tmp_path / "sky.png"
+    assert render_skyline.render(screen_runs[0] / "screen_result.json", png, "/opt/blender-4/blender") == (
+        "tier 2 (blender binary /opt/blender-4/blender)")
+    assert [call[0] for call in blender.calls] == ["/opt/blender-4/blender"]
+    assert png.read_text() == "binary:/opt/blender-4/blender"
+
+
+def test_render_tier3_matplotlib(screen_runs: tuple[Path, Path], tmp_path: Path, no_bpy: None, fake_tools: dict[str, str],
                                  capsys: pytest.CaptureFixture[str]):
     png = tmp_path / "sky.png"
     assert render_skyline.main([str(screen_runs[0] / "screen_result.json"), "--out", str(png)]) == 0
@@ -1109,19 +1121,19 @@ def test_render_tier3_matplotlib(screen_runs: tuple[Path, Path], tmp_path: Path,
 
 
 def test_render_falls_back_when_blender_fails(screen_runs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
-                                               tmp_path: Path, no_bpy: None, capsys: pytest.CaptureFixture[str]):
-    failing = _fake_blender(tmp_path / "bin", "blender", exit_code=3, write_png=False)
-    monkeypatch.setenv("PATH", str(failing.parent))
-    monkeypatch.delenv("SHARPE_OBSERVATORY_BLENDER", raising=False)
+                                               tmp_path: Path, no_bpy: None, fake_tools: dict[str, str],
+                                               capsys: pytest.CaptureFixture[str]):
+    monkeypatch.setattr(render_skyline.subprocess, "run", FakeBlender(exit_code=3, write_png=False))
+    fake_tools["blender"] = "/usr/bin/blender"
     png = tmp_path / "sky.png"
     assert render_skyline.render(screen_runs[0] / "screen_result.json", png) == "tier 3 (matplotlib)"
     assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
-    assert (f"[render] tier 2 (blender binary {failing}) skipped: blender exited with code 3: "
+    assert ("[render] tier 2 (blender binary /usr/bin/blender) skipped: blender exited with code 3: "
             "Error: Python script failed | Traceback line one | KeyError: boom") in capsys.readouterr().err
 
 
 def test_render_without_matplotlib_is_the_only_hard_failure(screen_runs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
-                                                             tmp_path: Path, no_bpy: None, no_blender: None,
+                                                             tmp_path: Path, no_bpy: None, fake_tools: dict[str, str],
                                                              capsys: pytest.CaptureFixture[str]):
     monkeypatch.setitem(sys.modules, "matplotlib", None)
     with pytest.raises(SystemExit) as info:
@@ -1380,6 +1392,66 @@ def test_cache_read_cleans_zero_closes(tmp_path: Path, capsys: pytest.CaptureFix
     assert "[clean] 1 non-positive close set to missing (DEC)" in capsys.readouterr().err
 
 
+PART_DATES = "date\n2026-10-08\n2026-10-07\n"  # deliberately out of order: load_directory sorts by date
+
+
+def _price_dir(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
+    directory = tmp_path / name
+    directory.mkdir()
+    (directory / "universe.csv").write_text("ticker,sector\nAAA,X\nBBB,X\nCCC,Y\n")
+    (directory / "risk_free.csv").write_text("date,rf_daily\n2026-10-07,0.0\n2026-10-08,0.0\n")
+    (directory / "factors.csv").write_text("date,mkt_rf,smb,hml\n2026-10-07,0,0,0\n2026-10-08,0,0,0\n")
+    for file_name, text in files.items():
+        (directory / file_name).write_text(text)
+    return directory
+
+
+def test_load_directory_joins_price_parts_like_a_single_file(tmp_path: Path):
+    single = _price_dir(tmp_path, "single", {"prices.csv": "date,AAA,BBB,CCC\n2026-10-08,11.5,21.0,31.0\n2026-10-07,10.0,20.0,30.25\n"})
+    split = _price_dir(tmp_path, "split", {"prices-2.csv": "date,CCC\n2026-10-08,31.0\n2026-10-07,30.25\n",
+                                           "prices-1.csv": "date,AAA,BBB\n2026-10-08,11.5,21.0\n2026-10-07,10.0,20.0\n"})
+    expected = pd.DataFrame({"AAA": [10.0, 11.5], "BBB": [20.0, 21.0], "CCC": [30.25, 31.0]},
+                            index=pd.DatetimeIndex(["2026-10-07", "2026-10-08"], name="date"))
+    for directory in (single, split):
+        pd.testing.assert_frame_equal(fetch_data.load_directory(directory).prices, expected, check_exact=True)
+    # Parts join in numeric order (prices-2 before prices-10), not file-name order.
+    eleven = _price_dir(tmp_path, "eleven", {f"prices-{k}.csv": f"date,P{k}\n2026-10-07,1.0\n" for k in range(1, 12)})
+    assert list(fetch_data.read_prices(eleven).columns) == [f"P{k}" for k in range(1, 12)]
+
+
+def test_load_directory_rejects_ambiguous_or_broken_price_parts(tmp_path: Path):
+    part1 = "date,AAA,BBB\n2026-10-08,11.5,21\n2026-10-07,10,20\n"
+    cases = {
+        "both": ({"prices.csv": part1, "prices-1.csv": part1}, ValueError, "has both prices.csv and prices-N.csv parts"),
+        "gap": ({"prices-1.csv": part1, "prices-3.csv": "date,CCC\n2026-10-08,31\n2026-10-07,30\n"},
+                ValueError, r"not numbered 1\.\.2: \['prices-1.csv', 'prices-3.csv'\]"),
+        "dates": ({"prices-1.csv": part1, "prices-2.csv": "date,CCC\n2026-10-09,31\n2026-10-07,30\n"},
+                  ValueError, "prices-2.csv has different dates from prices-1.csv"),
+        "dup": ({"prices-1.csv": part1, "prices-2.csv": "date,BBB\n2026-10-08,21\n2026-10-07,20\n"},
+                ValueError, r"more than one price part: \['BBB'\]"),
+        "none": ({}, FileNotFoundError, "neither prices.csv nor prices-1.csv"),
+    }
+    for name, (files, error, message) in cases.items():
+        with pytest.raises(error, match=message):
+            fetch_data.load_directory(_price_dir(tmp_path, name, files))
+
+
+def test_sample_prices_are_split_under_200_kib_and_reproducible(tmp_path: Path):
+    import make_sample_data
+
+    committed = sorted(path.name for path in fetch_data.SAMPLE_DIR.glob("prices*.csv"))
+    assert committed == ["prices-1.csv", "prices-2.csv", "prices-3.csv", "prices-4.csv"]
+    assert all((fetch_data.SAMPLE_DIR / name).stat().st_size < 200 * 1024 for name in committed)
+    out = tmp_path / "sample"
+    out.mkdir()
+    (out / "prices.csv").write_text("date,OLD\n")  # a stale single file must not survive regeneration
+    (out / "prices-9.csv").write_text("date,OLD\n")
+    assert make_sample_data.main(["--out-dir", str(out)]) == 0
+    assert sorted(path.name for path in out.iterdir()) == sorted(committed + ["universe.csv", "risk_free.csv", "factors.csv"])
+    for path in out.iterdir():
+        assert path.read_bytes() == (fetch_data.SAMPLE_DIR / path.name).read_bytes(), path.name
+
+
 def test_nonfinite_sharpe_is_excluded_from_the_plane(tmp_path: Path):
     dataset = fetch_data.load_directory(_hygiene_dir(tmp_path))
     result = screen.screen(dataset, window=252, top=5)
@@ -1459,6 +1531,20 @@ def test_icon_is_deterministic_and_sized(tmp_path: Path):
         assert data[:8] == b"\x89PNG\r\n\x1a\n"
         assert (int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")) == (size, size)
         assert (REPO / "assets" / path.name).read_bytes() == data  # the committed icon is the generator's output
+
+
+def test_plugin_icon_is_a_copy_of_the_512_icon(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    import make_icon
+
+    plugin_icon = tmp_path / "plugin" / "icon.png"
+    assert make_icon.main(["--out-dir", str(tmp_path / "assets"), "--plugin-icon", str(plugin_icon)]) == 0
+    assert plugin_icon.read_bytes() == (tmp_path / "assets" / "icon-512.png").read_bytes()
+    assert capsys.readouterr().out.splitlines()[-1] == f"wrote {plugin_icon}"
+    committed = (REPO / ".claude-plugin" / "icon.png").read_bytes()
+    assert committed == (REPO / "assets" / "icon-512.png").read_bytes()
+    assert committed[:8] == b"\x89PNG\r\n\x1a\n"
+    assert (int.from_bytes(committed[16:20], "big"), int.from_bytes(committed[20:24], "big")) == (512, 512)
+    assert len(committed) < 2_000_000
 
 
 def test_publishing_docs_exist_and_links_resolve():
