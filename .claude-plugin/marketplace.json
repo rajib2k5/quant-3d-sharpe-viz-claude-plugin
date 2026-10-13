@@ -1,0 +1,14 @@
+{
+  "name": "quant-3d-sharpe-viz",
+  "owner": {
+    "name": "Rajib Bahar"
+  },
+  "description": "Marketplace for Sharpe Observatory: a Sharpe/alpha stock screen with a multiple-testing luck correction and a 3D skyline view.",
+  "plugins": [
+    {
+      "name": "sharpe-observatory",
+      "source": "./",
+      "description": "Screen a stock universe by Sharpe ratio and Jensen's alpha with a multiple-testing luck correction (Probabilistic and Deflated Sharpe), then render the result as a 3D skyline in Blender or three.js. Offline sample data by default; not investment advice."
+    }
+  ]
+}

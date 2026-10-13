@@ -1,0 +1,9 @@
+{
+  "name": "sharpe-observatory",
+  "version": "0.1.0",
+  "description": "Screen a stock universe by Sharpe ratio and Jensen's alpha with a multiple-testing luck correction (Probabilistic and Deflated Sharpe), then render the result as a 3D skyline in Blender or three.js. Offline sample data by default; not investment advice.",
+  "author": {
+    "name": "Rajib Bahar"
+  },
+  "license": "MIT"
+}
