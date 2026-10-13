@@ -21,11 +21,20 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-from skyline_common import build_scene, load_result
+from skyline_common import TOWER_PITCH, build_scene, load_result
 
 THREE_VERSION = "0.160.0"
 THREE_BASE = f"https://cdn.jsdelivr.net/npm/three@{THREE_VERSION}"
 LABEL_TOP = 10
+# Ticker labels: the top 20 always; zooming in adds the nearest towers, up to 100 labels in all.
+# Near labels are fully opaque up to max(14 units, 0.25 x the reset-view distance) from the camera
+# and fade out by max(24 units, 0.45 x that distance), so a big city labels at a moderate zoom too.
+LABEL_LOD = {"always_top": 20, "budget": 100, "max_distance": 24.0, "full_distance": 14.0,
+             "full_scale": 0.25, "max_scale": 0.45, "candidates": 400,
+             "declutter": {"char_width": 7, "padding": 10, "height": 18, "cell": 64}}
+# Orbit limits: the camera stays between straight down (min) and just above the horizon (max),
+# and never goes below CAMERA_MIN_Y, so it can't sink under the floor.
+POLAR = {"min": 0.05, "max": round(math.pi / 2 - 0.08, 6), "camera_min_y": 0.5}
 NAV_MARGIN = 2.0
 LINK_TEMPLATES = {
     "google_finance": "https://www.google.com/finance?q={ticker}",
@@ -68,9 +77,13 @@ PAGE = r"""<!doctype html>
   #verdict-line { margin: 0 0 8px; font-size: var(--fs-body); }
   #windows { margin: 6px 0 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
   button, input { font: inherit; color: var(--text); }
-  #windows button, .toggle, #reset-view { background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+  #windows button, #layouts button, .toggle, #reset-view { background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
   #controls-hint { margin: 0 0 8px; }
   #reset-view { margin-left: 4px; font-size: var(--fs-caption); }
+  #layouts { margin: 0 0 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  #labels-toggle { margin-left: 8px; }
+  #layouts button[aria-pressed="true"] { background: #2d52e0; border-color: #2d52e0; }
+  #layout-note { position: fixed; right: 340px; bottom: 16px; font-size: var(--fs-caption); }
   #windows button[aria-pressed="true"] { background: #2d52e0; border-color: #2d52e0; }
   details summary { cursor: pointer; color: var(--text); font-weight: 600; font-size: var(--fs-section); margin: 4px 0; }
   details ul { margin: 4px 0; padding-left: 18px; color: var(--muted); }
@@ -90,7 +103,7 @@ PAGE = r"""<!doctype html>
   #search:focus, button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   #search-status { min-height: 1em; }
   #details[hidden] { display: none; }
-  #details { position: relative; }
+  #details { position: relative; flex: 0 1 auto; min-height: 0; max-height: calc(100vh - 32px); overflow-y: auto; }
   #details h2 { font-size: var(--fs-title); margin: 0; }
   #details-close { position: absolute; top: 6px; right: 8px; background: transparent; border: 0; font-size: 20px; cursor: pointer; }
   #d-json { max-height: 160px; overflow: auto; font-size: var(--fs-caption); background: #0f121c; padding: 6px;
@@ -115,6 +128,8 @@ PAGE = r"""<!doctype html>
   #tooltip div { white-space: nowrap; }
   #toolbar { display: none; }
   .label { color: #fff; font-size: var(--fs-caption); font-weight: 600; text-shadow: 0 0 4px #000, 0 0 2px #000; }
+  .label.dim, .label.near { font-weight: 500; color: #dfe4ee; }
+  .label.selected { background: #6fd6ff; color: #0b0d14; text-shadow: none; border-radius: 3px; padding: 0 4px; font-weight: 700; }
   .sector { color: var(--muted); font-size: var(--fs-caption); text-transform: uppercase; letter-spacing: .04em; text-shadow: 0 0 3px #000; }
   .ref { font-size: var(--fs-caption); color: var(--muted); text-shadow: 0 0 3px #000; font-variant-numeric: tabular-nums; }
   .ref.luck { color: #fff; background: #b3302f; border-radius: 4px; padding: 1px 6px; font-weight: 600; }
@@ -129,6 +144,7 @@ PAGE = r"""<!doctype html>
     body.show-legend #legend { display: block; }
     body.show-list #toplist, body.show-list #search-box { display: flex; }
     #colorbar { display: none; }
+    #layout-note { right: 8px; top: 46px; bottom: auto; }
   }
 </style>
 </head>
@@ -146,15 +162,21 @@ PAGE = r"""<!doctype html>
     <div class="stat"><b id="stat-plane">__PLANE__</b><span>luck plane Sharpe (__WINDOW__)</span></div>
   </div>
   <p id="verdict-line">__VERDICT__</p>
+  <p id="verdict-warning" class="caption">Not financial advice: historical statistics only.</p>
   <div id="windows" role="group" aria-label="Window"><span class="caption">Window:</span></div>
-  <p id="controls-hint" class="caption">Drag floor to move · drag sky to orbit · scroll to zoom · double-click a bar to fly to it · R resets.
+  <div id="layouts" role="group" aria-label="Layout"><span class="caption">Layout:</span>
+    <button type="button" data-layout="sector" aria-pressed="true">By sector</button>
+    <button type="button" data-layout="rank" aria-pressed="false">By Sharpe</button>
+    <button id="labels-toggle" type="button" aria-pressed="true" title="Ticker labels in the scene">Labels</button>
+  </div>
+  <p id="controls-hint" class="caption">Drag the city to move · drag sky to orbit · scroll to zoom · double-click a bar to fly to it · R resets · Layout: sector / by Sharpe · zoom in to label nearby bars.
     <button id="reset-view" type="button">Reset view</button></p>
   <details id="how-to-read" open>
     <summary>How to read a bar</summary>
     <ul>
       <li><strong>Height</strong> = annualized Sharpe; below the "Sharpe 0" level means negative.</li>
       <li><strong>Colour</strong> = Fama-French 3 alpha t-statistic (colour bar, bottom left).</li>
-      <li><strong>White outline</strong> = top __TOP_N__ by Sharpe; <strong>glow + label</strong> = top __LABEL_TOP__.</li>
+      <li><strong>White outline + label</strong> = top __TOP_N__ by Sharpe; <strong>glow</strong> = top __LABEL_TOP__. Zoom in to label nearby bars; the Labels button hides them.</li>
       <li><strong>Red plane</strong> = expected best-of-N Sharpe under a zero-alpha null. Above it is necessary, not sufficient.</li>
       <li>The skill test is <strong>DSR &ge; 0.95</strong>. Below it, a record cannot be told apart from luck at this sample size.</li>
       <li>Click a tower, a list row or search a ticker for details. Esc closes them.</li>
@@ -205,6 +227,7 @@ __TOP_LIST__
   </section>
 </div>
 <div id="tooltip" class="panel"></div>
+<div id="layout-note" class="panel" hidden></div>
 <script id="nav-logic">
 // Pure page rules, free of three.js and the DOM so the tests can run them in Node.
 globalThis.SkylineLinks = {
@@ -220,12 +243,36 @@ globalThis.SkylineNav = {
     const clamp = (v, [lo, hi]) => Math.min(Math.max(v, lo), hi);
     return { x: clamp(p.x, bounds.x), y: clamp(p.y, bounds.y), z: clamp(p.z, bounds.z) };
   },
-  // Which drag a press starts: left on the floor pans like a map, left elsewhere orbits,
-  // right always pans; anything else is left to OrbitControls.
+  // Which drag a press starts: left on the city (floor or a tower) pans like a map, left on the
+  // sky or empty space orbits, right always pans; anything else is left to OrbitControls.
   dragMode(button, hit) {
     if (button === 2) return "pan";
-    if (button === 0) return hit === "floor" ? "pan" : "orbit";
+    if (button === 0) return hit === null ? "orbit" : "pan";
     return null;
+  },
+  // Zoom limits from the framed (reset) distance: zooming out stops at 3x that view. Fog starts
+  // beyond the far side of the scene seen from the reset view and is only 35% dense at the scene
+  // centre from the farthest zoom; the far plane clears both the scene and the fog.
+  // Label fade distances scale with the reset-view distance (never below the absolute floors).
+  labelFade(framedDistance, lod) {
+    return { fullDistance: Math.max(lod.full_distance, lod.full_scale * framedDistance),
+      maxDistance: Math.max(lod.max_distance, lod.max_scale * framedDistance) };
+  },
+  // Where fly-to aims: the middle of the tower at its resting place (the end of any layout
+  // transition, `restingAt`, when one is running; else where it stands now).
+  flyTarget(standingAt, restingAt, signedHeight) {
+    const at = restingAt || standingAt;
+    return { x: at.x, y: (signedHeight < 0 ? signedHeight : 0) + Math.abs(signedHeight) / 2, z: at.z };
+  },
+  // Keep the camera above the floor whatever moved it (pan, keys, fly-to, orbit).
+  cameraAboveFloor(position, minY) {
+    return { x: position.x, y: Math.max(position.y, minY), z: position.z };
+  },
+  distanceLimits(framedDistance, sceneRadius) {
+    const maxDistance = 3 * framedDistance;
+    const fogNear = framedDistance + sceneRadius;
+    const fogFar = fogNear + (maxDistance - fogNear) / 0.35;
+    return { minDistance: 2, maxDistance, far: Math.max(maxDistance + 4 * sceneRadius, fogFar), fogNear, fogFar };
   },
   // Ground-plane step for arrow keys / WASD, relative to where the camera looks.
   keyPan(key, forward, step) {
@@ -237,6 +284,77 @@ globalThis.SkylineNav = {
     const fx = forward.x / len, fz = forward.z / len;
     // Screen-right on the ground is forward x up = (-fz, fx).
     return { x: (dir[1] * fx - dir[0] * fz) * step, z: (dir[1] * fz + dir[0] * fx) * step };
+  },
+  // Which towers carry a ticker label: the top `alwaysTop` ranks always, then the towers nearest
+  // the camera among those inside the view (projected with the column-major view-projection
+  // matrix `viewProj`: in front of the camera, NDC x and y within [-1, 1]) and within
+  // maxDistance, up to `budget` labels in all. Near labels fade from opacity 1 at fullDistance
+  // to 0 at maxDistance; always-on labels stay at 1.
+  pickLabels(items, cam, viewProj, opts) {
+    const m = viewProj;
+    const isTop = (t) => t.rank !== null && t.rank <= opts.alwaysTop;
+    const always = items.filter(isTop).sort((a, b) => a.rank - b.rank).map((t) => ({ ticker: t.ticker, opacity: 1 }));
+    const near = [];
+    for (const t of items) {
+      if (isTop(t)) continue;
+      const w = m[3] * t.x + m[7] * t.y + m[11] * t.z + m[15];
+      if (w <= 0) continue;
+      const nx = (m[0] * t.x + m[4] * t.y + m[8] * t.z + m[12]) / w;
+      const ny = (m[1] * t.x + m[5] * t.y + m[9] * t.z + m[13]) / w;
+      if (Math.abs(nx) > 1 || Math.abs(ny) > 1) continue;
+      const d = Math.hypot(t.x - cam.x, t.y - cam.y, t.z - cam.z);
+      if (d <= opts.maxDistance) near.push({ ticker: t.ticker, d });
+    }
+    near.sort((a, b) => a.d - b.d || (a.ticker < b.ticker ? -1 : a.ticker > b.ticker ? 1 : 0));
+    const room = Math.max(0, opts.budget - always.length);
+    return always.concat(near.slice(0, room).map(({ ticker, d }) => ({
+      ticker, opacity: d <= opts.fullDistance ? 1 : (opts.maxDistance - d) / (opts.maxDistance - opts.fullDistance) })));
+  },
+  // Screen-space declutter: place labels greedily in priority order (the selected tower, then
+  // top-ranked towers by rank, then the rest nearest-first) and skip any whose box (its measured
+  // text `width`, or text length x charWidth when not given, plus padding, by height, centred on
+  // its screen point) would overlap a label already placed. A coarse grid of `cell`-pixel buckets keeps the overlap test cheap.
+  // At most `budget` labels are placed. A top-20 label can lose to the selected tower or a
+  // higher rank.
+  declutter(candidates, opts) {
+    const key = (c) => [c.selected ? 0 : 1, c.top ? 0 : 1, c.top ? c.rank : c.distance];
+    const order = [...candidates].sort((a, b) => {
+      const ka = key(a), kb = key(b);
+      for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i];
+      return a.ticker < b.ticker ? -1 : a.ticker > b.ticker ? 1 : 0;
+    });
+    const grid = new Map();
+    const placed = [];
+    for (const c of order) {
+      if (placed.length >= opts.budget) break;
+      const w = (c.width ?? c.ticker.length * opts.charWidth) + opts.padding;
+      const box = { x0: c.x - w / 2, x1: c.x + w / 2, y0: c.y - opts.height / 2, y1: c.y + opts.height / 2 };
+      const cells = [];
+      for (let gx = Math.floor(box.x0 / opts.cell); gx <= Math.floor(box.x1 / opts.cell); gx++) {
+        for (let gy = Math.floor(box.y0 / opts.cell); gy <= Math.floor(box.y1 / opts.cell); gy++) cells.push(`${gx},${gy}`);
+      }
+      const hit = cells.some((k) => (grid.get(k) || []).some((o) => box.x0 < o.x1 && o.x0 < box.x1 && box.y0 < o.y1 && o.y0 < box.y1));
+      if (hit) continue;
+      for (const k of cells) {
+        if (!grid.has(k)) grid.set(k, []);
+        grid.get(k).push(box);
+      }
+      placed.push(c.ticker);
+    }
+    return placed;
+  },
+  // "By Sharpe" layout: every tower in one grid, ordered by Sharpe descending (missing last,
+  // ties by ticker), filled row by row with every other row reversed (serpentine) so heights
+  // fall off smoothly. Row 0, column 0 is the near corner (+x, +z, facing the camera).
+  rankLayout(items, cols, pitch) {
+    const value = (sr) => (sr === null || sr === undefined || Number.isNaN(sr) ? -Infinity : sr);
+    const order = [...items].sort((a, b) => value(b.sr) - value(a.sr) || (a.ticker < b.ticker ? -1 : a.ticker > b.ticker ? 1 : 0));
+    const rows = Math.ceil(order.length / cols);
+    return order.map((item, k) => {
+      const row = Math.floor(k / cols);
+      const col = row % 2 === 0 ? k % cols : cols - 1 - (k % cols);
+      return { ticker: item.ticker, row, col, x: ((cols - 1) / 2 - col) * pitch, z: ((rows - 1) / 2 - row) * pitch };
+    });
   },
 };
 </script>
@@ -268,9 +386,10 @@ stage.appendChild(labelRenderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(BG);
 const span = Math.max(DATA.extent.width, DATA.extent.depth, 8);
-const halfW = DATA.extent.width / 2 + 1.5;
-const halfD = DATA.extent.depth / 2 + 1.5;
-const camera = new THREE.PerspectiveCamera(45, 1, 0.1, span * 20);
+// Floor, planes and ruler cover whichever layout is larger.
+const halfW = DATA.floor_extent.width / 2 + 1.5;
+const halfD = DATA.floor_extent.depth / 2 + 1.5;
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, span * 20);  // far is reset by applyDistanceLimits()
 const viewDir = new THREE.Vector3(0.45, 0.8, 1.15).normalize();
 const sceneRadius = Math.hypot(halfW, halfD, 4);
 const home = new THREE.Vector3(0, 3, 0);
@@ -285,6 +404,8 @@ controls.target.copy(home);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.screenSpacePanning = false;
+controls.minPolarAngle = DATA.polar.min;
+controls.maxPolarAngle = DATA.polar.max;
 scene.fog = new THREE.Fog(BG, sceneRadius * 2.2, sceneRadius * 5.5);
 
 // Two lights and no shadows keep the cost flat at 500+ towers.
@@ -315,6 +436,7 @@ const floorHit = new THREE.Mesh(
   new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, colorWrite: false }),
 );
 scene.add(floorHit);
+const sectorDecor = [];
 for (const tile of DATA.sector_tiles) {
   const mesh = new THREE.Mesh(
     new THREE.PlaneGeometry(tile.w, tile.d).rotateX(-Math.PI / 2),
@@ -322,6 +444,7 @@ for (const tile of DATA.sector_tiles) {
   );
   mesh.position.set(tile.cx, 0.005, -tile.cy);
   scene.add(mesh);
+  sectorDecor.push(mesh);
 }
 label(DATA.zero_label, "ref zero", -halfW, 0, halfD);
 
@@ -348,7 +471,7 @@ const towers = DATA.towers.map((t, index) => {
     handle.userData.outline = new THREE.LineSegments(edges, outlineMaterial);
     scene.add(handle.userData.outline);
   }
-  if (glow) handle.userData.label = label(t.ticker, "label", t.x, 0, -t.y);
+  if (t.top) handle.userData.label = label(t.ticker, glow ? "label" : "label dim", t.x, 0, -t.y);
   byTicker.set(t.ticker.toUpperCase(), handle);
   return handle;
 });
@@ -356,7 +479,7 @@ scene.add(towerMesh);
 const instanceMatrix = new THREE.Matrix4();
 const unitQuaternion = new THREE.Quaternion();
 const instanceScale = new THREE.Vector3();
-for (const s of DATA.sectors) label(s.name, "sector", s.x, 0, -s.y);
+for (const s of DATA.sectors) sectorDecor.push(label(s.name, "sector", s.x, 0, -s.y));
 
 // Luck plane, slightly desaturated so labels stay readable through it.
 const luckColor = new THREE.Color().setRGB(...DATA.luck_rgb, THREE.SRGBColorSpace).lerp(new THREE.Color(0x777777), 0.25);
@@ -389,10 +512,14 @@ const planeTickLabel = label("", "ref luck", rulerX - 1.6, 0, rulerZ);
 let current = DATA.window;
 let selected = null;
 let hovered = null;
-function applyWindow(w) {
-  current = w;
+let layout = "sector";
+let navBounds = DATA.nav_bounds;
+let shuffle = null;
+// Writes every instance matrix (and the outlines, labels and cage that follow towers) from
+// each handle's ground position and the current window's height.
+function placeTowers() {
   for (const handle of towers) {
-    const h = handle.userData.tower.height[w];
+    const h = handle.userData.tower.height[current];
     handle.position.y = h < 0 ? h : 0;
     instanceScale.set(1, Math.max(Math.abs(h), 0.001), 1);
     towerMesh.setMatrixAt(handle.index, instanceMatrix.compose(handle.position, unitQuaternion, instanceScale));
@@ -403,8 +530,38 @@ function applyWindow(w) {
     if (handle.userData.label) handle.userData.label.position.set(handle.position.x, Math.max(h, 0) + 0.45, handle.position.z);
   }
   towerMesh.instanceMatrix.needsUpdate = true;
-  towerMesh.computeBoundingSphere();
   if (selected) placeCage(selected);
+}
+function layoutTargets() {
+  if (layout === "sector") return towers.map((handle) => new THREE.Vector3(handle.userData.tower.x, 0, -handle.userData.tower.y));
+  const cells = SkylineNav.rankLayout(
+    towers.map((handle) => ({ ticker: handle.userData.tower.ticker, sr: handle.userData.tower.sr_ann[current] })),
+    DATA.rank_layout.cols, DATA.rank_layout.pitch);
+  const at = new Map(cells.map((cell) => [cell.ticker, cell]));
+  return towers.map((handle) => { const cell = at.get(handle.userData.tower.ticker); return new THREE.Vector3(cell.x, 0, cell.z); });
+}
+// Animate every tower to its place in the active layout (ease in-out, 0.8 s).
+function arrange(ms) {
+  shuffle = { start: performance.now(), ms, from: towers.map((handle) => handle.position.clone()), to: layoutTargets() };
+}
+function setLayout(next) {
+  layout = next;
+  navBounds = layout === "rank" ? DATA.nav_bounds_rank : DATA.nav_bounds;
+  for (const item of sectorDecor) item.visible = layout === "sector";
+  for (const b of document.querySelectorAll("#layouts button[data-layout]")) b.setAttribute("aria-pressed", String(b.dataset.layout === layout));
+  updateLayoutNote();
+  arrange(800);
+}
+function updateLayoutNote() {
+  const note = document.getElementById("layout-note");
+  note.hidden = layout !== "rank";
+  note.textContent = `sorted by Sharpe (${current})`;
+}
+function applyWindow(w) {
+  current = w;
+  placeTowers();
+  towerMesh.computeBoundingSphere();
+  if (layout === "rank") { updateLayoutNote(); arrange(800); }
   const planeY = DATA.luck_height[w];
   luck.position.y = planeY;
   luckLabel.position.y = planeY;
@@ -428,6 +585,11 @@ for (const w of DATA.windows) {
   document.getElementById("windows").appendChild(b);
 }
 applyWindow(current);
+for (const b of document.querySelectorAll("#layouts button[data-layout]")) b.addEventListener("click", () => setLayout(b.dataset.layout));
+document.getElementById("labels-toggle").addEventListener("click", (event) => {
+  labelsOn = !labelsOn;
+  event.currentTarget.setAttribute("aria-pressed", String(labelsOn));
+});
 if (window.innerWidth < 900) document.getElementById("how-to-read").open = false;
 
 // Small screens: panels are overlays behind toolbar toggles.
@@ -458,6 +620,81 @@ function setGlow(handle) {
 function placeCage(handle) {
   selectionCage.position.copy(handle.position);
   selectionCage.scale.set(1, Math.max(Math.abs(handle.userData.tower.height[current]), 0.001), 1);
+}
+
+// Zoom-aware labels: candidates are the top 20 plus the towers nearest the camera in view
+// (pickLabels); a screen-space declutter then keeps only labels that don't overlap, at most
+// `budget` of them. The selected tower's label always wins and shows even with labels off.
+let labelsOn = true;
+let labelFade = { fullDistance: DATA.label_lod.full_distance, maxDistance: DATA.label_lod.max_distance };
+const labelPool = Array.from({ length: DATA.label_lod.budget }, () => {
+  const item = label("", "label near", 0, 0, 0);
+  item.visible = false;
+  return item;
+});
+const selectedLabel = label("", "label selected", 0, 0, 0);
+selectedLabel.visible = false;
+function labelTop(handle) {
+  return Math.max(handle.userData.tower.height[current], 0) + 0.45;
+}
+const projected = new THREE.Vector3();
+// Label text widths come from canvas text metrics in the label font (cached per ticker), so the
+// declutter boxes match what the browser draws without measuring any DOM element.
+const textMetrics = document.createElement("canvas").getContext("2d");
+textMetrics.font = `600 11.5px ${getComputedStyle(document.body).fontFamily}`;
+const textWidths = new Map();
+function textWidth(ticker) {
+  if (!textWidths.has(ticker)) textWidths.set(ticker, textMetrics.measureText(ticker).width);
+  return textWidths.get(ticker);
+}
+function updateLabels() {
+  camera.updateMatrixWorld();
+  const viewProj = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).elements;
+  const lod = DATA.label_lod;
+  const picks = labelsOn ? SkylineNav.pickLabels(
+    towers.map((handle) => ({ ticker: handle.userData.tower.ticker, rank: handle.userData.tower.rank,
+      x: handle.position.x, y: labelTop(handle), z: handle.position.z })),
+    camera.position, viewProj, { alwaysTop: lod.always_top, budget: lod.candidates,
+      maxDistance: labelFade.maxDistance, fullDistance: labelFade.fullDistance }) : [];
+  const width = window.innerWidth, height = window.innerHeight;
+  const candidate = (handle, isSelected) => {
+    projected.set(handle.position.x, labelTop(handle), handle.position.z).project(camera);
+    const t = handle.userData.tower;
+    return { ticker: t.ticker, width: textWidth(t.ticker), x: (projected.x + 1) / 2 * width, y: (1 - projected.y) / 2 * height,
+      selected: isSelected, top: t.rank !== null && t.rank <= lod.always_top, rank: t.rank,
+      distance: camera.position.distanceTo(handle.position) };
+  };
+  const candidates = selected ? [candidate(selected, true)] : [];
+  for (const pick of picks) {
+    const handle = byTicker.get(pick.ticker.toUpperCase());
+    if (handle !== selected) candidates.push(candidate(handle, false));
+  }
+  const placed = new Set(SkylineNav.declutter(candidates, { budget: lod.budget, charWidth: lod.declutter.char_width,
+    padding: lod.declutter.padding, height: lod.declutter.height, cell: lod.declutter.cell }));
+  const opacity = new Map(picks.map((pick) => [pick.ticker, pick.opacity]));
+  for (const handle of towers) {
+    const own = handle.userData.label;
+    if (own) {
+      own.visible = placed.has(handle.userData.tower.ticker);
+      own.element.classList.toggle("selected", handle === selected);
+    }
+  }
+  let used = 0;
+  for (const pick of picks) {
+    const handle = byTicker.get(pick.ticker.toUpperCase());
+    if (handle.userData.label || handle === selected || !placed.has(pick.ticker) || used >= labelPool.length) continue;
+    const item = labelPool[used++];
+    if (item.element.textContent !== pick.ticker) item.element.textContent = pick.ticker;
+    item.element.style.opacity = opacity.get(pick.ticker).toFixed(2);
+    item.position.set(handle.position.x, labelTop(handle), handle.position.z);
+    item.visible = true;
+  }
+  for (let i = used; i < labelPool.length; i++) labelPool[i].visible = false;
+  selectedLabel.visible = Boolean(selected && !selected.userData.label && placed.has(selected.userData.tower.ticker));
+  if (selectedLabel.visible) {
+    selectedLabel.element.textContent = selected.userData.tower.ticker;
+    selectedLabel.position.set(selected.position.x, labelTop(selected), selected.position.z);
+  }
 }
 function field(name, value) {
   const dt = document.createElement("dt");
@@ -571,9 +808,12 @@ function flyTo(toTarget, toCamera, ms) {
   flight = { start: performance.now(), ms, fromTarget: controls.target.clone(), fromCamera: camera.position.clone(),
     toTarget, toCamera };
 }
+// Where a tower will stand once any layout transition finishes (fly-to aims there, not mid-move).
 function flyToTower(mesh) {
-  const h = Math.abs(mesh.userData.tower.height[current]);
-  const target = new THREE.Vector3(mesh.position.x, mesh.position.y + h / 2, mesh.position.z);
+  const signed = mesh.userData.tower.height[current];
+  const h = Math.abs(signed);
+  const aim = SkylineNav.flyTarget(mesh.position, shuffle ? shuffle.to[mesh.index] : null, signed);
+  const target = new THREE.Vector3(aim.x, aim.y, aim.z);
   const offset = camera.position.clone().sub(controls.target).normalize().multiplyScalar(Math.max(10, h * 2.5));
   flyTo(target, target.clone().add(offset), 700);
 }
@@ -585,11 +825,14 @@ function moveView(delta) {
 }
 function clampView() {
   const t = controls.target;
-  const c = SkylineNav.clampTarget(t, DATA.nav_bounds);
+  const c = SkylineNav.clampTarget(t, navBounds);
   const correction = new THREE.Vector3(c.x - t.x, c.y - t.y, c.z - t.z);
-  if (correction.lengthSq() === 0) return;
-  t.add(correction);
-  camera.position.add(correction);
+  if (correction.lengthSq() > 0) {
+    t.add(correction);
+    camera.position.add(correction);
+  }
+  const above = SkylineNav.cameraAboveFloor(camera.position, DATA.polar.camera_min_y);
+  camera.position.y = above.y;
 }
 function resetView() {
   flyTo(home.clone(), framedPosition(), 700);
@@ -660,9 +903,9 @@ function updateHover(event) {
   tooltip.style.left = `${Math.min(event.clientX + 14, window.innerWidth - tooltip.offsetWidth - 8)}px`;
   tooltip.style.top = `${Math.min(event.clientY + 14, window.innerHeight - tooltip.offsetHeight - 8)}px`;
 }
-// A click is a press and release without dragging. A left press on the floor starts a
-// map-style drag that keeps the grabbed ground point under the cursor; any other drag is
-// OrbitControls' (left orbits, right pans parallel to the ground, wheel zooms, touch gestures).
+// A click is a press and release without dragging. A left press on the floor or a tower starts
+// a map-style drag that keeps the grabbed ground point under the cursor; any other drag is
+// OrbitControls' (left on the sky orbits, right pans parallel to the ground, wheel zooms, touch).
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 let pressedAt = null;
 let drag = null;
@@ -720,18 +963,31 @@ stage.addEventListener("pointerup", (event) => {
   handleClick(event);
 });
 renderer.domElement.addEventListener("pointerup", handleClick);
-renderer.domElement.addEventListener("dblclick", (event) => {
+// On the stage, not the canvas: a press on a tower captures the pointer to the stage for panning.
+stage.addEventListener("dblclick", (event) => {
   const mesh = towerAt(event);
   clearTimeout(clickTimer);
   if (mesh) select(mesh, true);
 });
 
+function applyDistanceLimits() {
+  const framedDistance = framedPosition().distanceTo(home);
+  const limits = SkylineNav.distanceLimits(framedDistance, sceneRadius);
+  labelFade = SkylineNav.labelFade(framedDistance, DATA.label_lod);
+  controls.minDistance = limits.minDistance;
+  controls.maxDistance = limits.maxDistance;
+  camera.far = limits.far;
+  scene.fog.near = limits.fogNear;
+  scene.fog.far = limits.fogFar;
+  camera.updateProjectionMatrix();
+}
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
   renderer.setSize(w, h);
   labelRenderer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  applyDistanceLimits();
 }
 window.addEventListener("resize", resize);
 resize();
@@ -747,8 +1003,19 @@ renderer.setAnimationLoop((now) => {
     camera.position.lerpVectors(flight.fromCamera, flight.toCamera, e);
     if (k === 1) flight = null;
   }
+  if (shuffle) {
+    const k = Math.min((now - shuffle.start) / shuffle.ms, 1);
+    const e = k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
+    towers.forEach((handle, i) => {
+      handle.position.x = shuffle.from[i].x + (shuffle.to[i].x - shuffle.from[i].x) * e;
+      handle.position.z = shuffle.from[i].z + (shuffle.to[i].z - shuffle.from[i].z) * e;
+    });
+    placeTowers();
+    if (k === 1) { shuffle = null; towerMesh.computeBoundingSphere(); }
+  }
   controls.update();
   clampView();
+  updateLabels();
   renderer.render(scene, camera);
   labelRenderer.render(scene, camera);
 });
@@ -804,21 +1071,38 @@ def nav_bounds(scene: dict[str, Any], low: int, high: int) -> dict[str, list[flo
             "z": [round(-half_d, 4), round(half_d, 4)]}
 
 
+def rank_nav_bounds(cols: int, low: int, high: int, scale: float) -> dict[str, list[float]]:
+    """Target bounds for the "By Sharpe" grid: a square of ``cols`` towers a side, centred,
+    plus the page's 1.5-unit border and NAV_MARGIN; same vertical range as nav_bounds."""
+    half = cols * TOWER_PITCH / 2 + 1.5 + NAV_MARGIN
+    return {"x": [round(-half, 4), round(half, 4)],
+            "y": [round(low * scale - 1.0, 4), round(high * scale + 1.0, 4)],
+            "z": [round(-half, 4), round(half, 4)]}
+
+
 def page_data(scene: dict[str, Any]) -> dict[str, Any]:
     """The scene plus what only the page needs: links, labels, ruler ticks, verdict and sector tints."""
     values = [v for t in scene["towers"] for v in t["sr_ann"].values() if v is not None]
     values += [v for v in scene["luck_horizon_ann"].values() if v is not None] + [0.0]
     low, high = math.floor(min(values)), math.ceil(max(values))
     plane = scene["luck_horizon_ann"][scene["window"]]
+    rank_cols = max(1, math.ceil(math.sqrt(len(scene["towers"]))))
+    rank_side = rank_cols * TOWER_PITCH
     return {
         **scene,
         "label_top": LABEL_TOP,
+        "label_lod": LABEL_LOD,
+        "polar": POLAR,
         "links": LINK_TEMPLATES,
         "detail_fields": DETAIL_FIELDS,
         "zero_label": "Sharpe 0",
         "luck_label": {w: f"Luck plane: Sharpe {v:.2f} ({w})" for w, v in scene["luck_horizon_ann"].items() if v is not None},
         "ruler_ticks": list(range(low, high + 1)),
         "nav_bounds": nav_bounds(scene, low, high),
+        "rank_layout": {"cols": rank_cols, "pitch": TOWER_PITCH},
+        "nav_bounds_rank": rank_nav_bounds(rank_cols, low, high, scene["scale"]),
+        "floor_extent": {"width": round(max(scene["extent"]["width"], rank_side), 4),
+                         "depth": round(max(scene["extent"]["depth"], rank_side), 4)},
         "verdict": {
             "n": scene["N"],
             "pass": f"{scene['top_dsr_passing']} of {scene['top_n']}",

@@ -1,4 +1,7 @@
-# Sharpe Observatory
+# <img src="assets/icon-512.png" alt="Sharpe Observatory icon: a small skyline of towers with one gold tower piercing a red plane" width="44"> Sharpe Observatory
+
+> [!WARNING]
+> **Not financial advice.** Sharpe Observatory reports historical statistics for research and education only. Nothing it produces is a recommendation to buy, sell or hold any security, and past Sharpe ratios and alphas do not predict future results. Consult a licensed financial professional before making investment decisions.
 
 A Claude Code plugin that screens a stock universe by Sharpe ratio and Jensen's alpha, corrects the screen for luck, and renders the result as a 3D skyline: a PNG (matplotlib, or Blender when available), a live Blender scene, or a three.js page in the browser.
 
@@ -11,7 +14,7 @@ A Claude Code plugin that screens a stock universe by Sharpe ratio and Jensen's 
 - **Screens** every name over a trailing window (1, 3 or 5 years) by annualized Sharpe ratio, and estimates CAPM and Fama-French 3 alphas with classic OLS t-statistics.
 - **Corrects for luck** with the Probabilistic Sharpe Ratio, the expected maximum Sharpe ratio across N trials, and the Deflated Sharpe Ratio.
 - **Reports** a ranked top-20 table (`out/report.md`) and a machine-readable result (`out/screen_result.json`).
-- **Visualizes** the screen as a skyline: one tower per stock, grouped by sector, height = Sharpe, colour = alpha t-statistic, the top 20 glowing, and a red plane at the expected best-of-N Sharpe. Output is a self-contained Blender script with the data embedded (`out/skyline_bpy.py`), a PNG rendered headless with no installation (`out/skyline.png`, matplotlib by default, Blender when available), or an interactive single-file page that loads three.js from the jsdelivr CDN (`out/skyline.html`). The page opens with a verdict strip (names screened, how many of the top 20 pass DSR >= 0.95, the luck plane's value) and a one-line plain-English verdict. Drag the floor to move like a map, drag the sky to orbit, scroll to zoom, double-click any bar to fly to it, and press R to reset the view. You can click any tower, a row of the top-20 list, or search any ticker to see its rank, Sharpe in every window, CAPM and FF3 alpha, PSR, DSR and days of data, copy the row as JSON, or follow links to Google Finance, SEC EDGAR (sec.gov) and the company website. Esc closes the details. The scene also shows a labelled Sharpe 0 level, the luck plane's value, a value ruler and a floor tint per sector.
+- **Visualizes** the screen as a skyline: one tower per stock, grouped by sector, height = Sharpe, colour = alpha t-statistic, the top 20 glowing, and a red plane at the expected best-of-N Sharpe. Output is a self-contained Blender script with the data embedded (`out/skyline_bpy.py`), a PNG rendered headless with no installation (`out/skyline.png`, matplotlib by default, Blender when available), or an interactive single-file page that loads three.js from the jsdelivr CDN (`out/skyline.html`). The page opens with a verdict strip (names screened, how many of the top 20 pass DSR >= 0.95, the luck plane's value) and a one-line plain-English verdict. Drag the city (floor or towers) to move like a map, drag the sky to orbit, scroll to zoom, double-click any bar to fly to it, and press R to reset the view. A Layout switch re-sorts the towers from sector (or exchange) blocks into one grid ordered by Sharpe, tallest at the near corner, with an animated transition. Every bar can be identified by its ticker in the scene. The top 20 are always labelled, and zooming in labels the nearest bars too, up to 100 labels that fade with distance and never overlap (labels that would collide are skipped, keeping the selected bar, then the highest-ranked, then the nearest). A Labels button hides them, and the selected bar keeps a highlighted label. The static PNG labels only the top 10, since a still image can't carry thousands of labels. You can click any tower, a row of the top-20 list, or search any ticker to see its rank, Sharpe in every window, CAPM and FF3 alpha, PSR, DSR and days of data, copy the row as JSON, or follow links to Google Finance, SEC EDGAR (sec.gov) and the company website. Esc closes the details. The scene also shows a labelled Sharpe 0 level, the luck plane's value, a value ruler and a floor tint per sector.
 
 It ships two skills: `sharpe-screen` (run and explain the screen) and `sharpe-skyline` (build the 3D scene).
 
@@ -23,7 +26,7 @@ If you rank 500 stocks by Sharpe ratio, the winner looks impressive even if no s
 
 These are the formulas as implemented in `scripts/metrics.py` and `scripts/screen.py`. "Per-period" means daily; only Sharpe ratios shown to the user are annualized.
 
-**Excess returns.** r_t is the simple daily return of the adjusted close and rf_t = DGS3MO / 100 / 252 (FRED 3-month T-bill, forward-filled onto trading days). The excess return is x_t = r_t - rf_t. A window of W trading days (252, 756 or 1260) is scored only if at least 90% of its days have a return.
+**Excess returns.** r_t is the simple daily return of the adjusted close and rf_t = DGS3MO / 100 / 252 (FRED 3-month T-bill, forward-filled onto trading days). The excess return is x_t = r_t - rf_t. A window of W trading days (252, 756 or 1260) is scored only if at least 90% of its days have a return. As a data-quality rule (an implementation choice, not from the papers), a covered name is still left unscored, unranked and out of N and the luck plane when its raw daily returns in the window have zero variance ("flat price"), when more than 50% of them are exactly zero ("stale quotes": halted or unrefreshed prices), or when its Sharpe is not finite. For such a name, excess returns are just minus the risk-free rate, whose tiny variance would produce an absurd Sharpe (around -390 for three stale quotes in a real run). Excluded names and their reasons are listed in the result's `excluded_unscoreable` field. Names that fail the coverage rule are listed under `excluded_coverage`. The report's Exclusions section shows both, with up to 20 tickers per reason.
 
 **Sharpe ratio** (Sharpe 1994).
 
@@ -94,17 +97,25 @@ Live data is fetched **only** when you pass `--live`, and then only from these p
 | `www.nasdaqtrader.com` | **`--index us-all` only:** the Nasdaq Trader symbol directory of every US-listed security (see "Full US market" below). Skipped with `--universe` or the default S&P 500 index | `https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt`, `https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt` |
 | `raw.githubusercontent.com` | The universe: current S&P 500 constituents (ticker, GICS sector) from the open [datasets/s-and-p-500-companies](https://github.com/datasets/s-and-p-500-companies) project. Skipped when you pass `--universe` | `https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv` |
 | `en.wikipedia.org` | **Fallback only**, contacted only if the GitHub list cannot be fetched, has a changed schema or has fewer than 400 rows: the constituents table of the Wikipedia article | `https://en.wikipedia.org/wiki/List_of_S%26P_500_companies` |
-| Yahoo Finance: `query1.finance.yahoo.com`, `query2.finance.yahoo.com` | Daily closes adjusted for splits and dividends, via the [yfinance](https://pypi.org/project/yfinance/) library; one ticker at a time, at least 0.5 s apart by default (`--throttle`), slowing down automatically when Yahoo pushes back. To get a session cookie, yfinance may also contact `fc.yahoo.com`, `finance.yahoo.com` and, where Yahoo asks for cookie consent, `guce.yahoo.com` / `consent.yahoo.com` | Yahoo Finance chart API (called by yfinance) |
+| Yahoo Finance: `query1.finance.yahoo.com`, `query2.finance.yahoo.com` | Daily closes adjusted for splits and dividends, via the [yfinance](https://pypi.org/project/yfinance/) library. Tickers are requested in chunks of 50 per `yf.download` call (yfinance fetches the symbols of a chunk in parallel), with at least 0.5 s between calls by default (`--throttle`). The pause grows automatically when Yahoo pushes back, and names a chunk misses get a one-at-a-time retry pass. To get a session cookie, yfinance may also contact `fc.yahoo.com`, `finance.yahoo.com` and, where Yahoo asks for cookie consent, `guce.yahoo.com` / `consent.yahoo.com` | Yahoo Finance chart API (called by yfinance) |
 | `fred.stlouisfed.org` | 3-month Treasury bill rate (risk-free), de-annualized to daily | `https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO` |
 | `mba.tuck.dartmouth.edu` | Fama-French 3 daily factors from the Kenneth R. French Data Library | `https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_daily_CSV.zip` |
 
 No API keys, accounts or credentials are used, and nothing is uploaded. In live mode yfinance keeps a small local cache (time zones and session cookie) in a `py-yfinance` folder under your user cache directory (for example `~/.cache/py-yfinance` on Linux). The three.js page loads three.js 0.160.0 from `cdn.jsdelivr.net` when you open it in a browser. Its details panel links to `www.google.com` (Google Finance and the website search), `www.sec.gov` (EDGAR) and any `website` URL from your universe CSV; those open in a new tab only when you click them.
 
-**yfinance is an unofficial API.** It is not affiliated with or endorsed by Yahoo; it reads the same endpoints the Yahoo Finance website uses, which can change, rate-limit or block automated clients without notice, and Yahoo's terms govern use of the data. Backoff is automatic. A transient failure (timeout, dropped connection, HTTP 429 or 500-504) is retried twice, after 4 s and then 15 s; a permanent one (such as HTTP 404 or a delisted ticker) is not. The pause between tickers doubles, up to 8 s, after any ticker that failed or needed a retry, and halves back toward the `--throttle` floor after 20 clean fetches in a row. A ticker that still fails is skipped and reported on stderr. The fetch stops with an error instead of requesting the rest of the universe after 5 consecutive failures, or once at least 20 tickers have failed and they are more than half of those attempted, since either pattern usually means the source is blocking or rate-limiting.
+**yfinance is an unofficial API.** It is not affiliated with or endorsed by Yahoo; it reads the same endpoints the Yahoo Finance website uses, which can change, rate-limit or block automated clients without notice, and Yahoo's terms govern use of the data. Backoff is automatic:
+
+- The pause between chunk calls doubles, up to 8 s, after a chunk fails, and halves back toward the `--throttle` floor after 20 clean calls in a row.
+- Names a chunk returns empty go to the one-at-a-time retry pass.
+- In that pass, a transient failure (timeout, dropped connection, HTTP 429 or 500-504) is retried twice, after 4 s and then 15 s. A permanent one (such as HTTP 404 or a delisted ticker) is not. The same adaptive pause applies between tickers.
+- A ticker that still fails is skipped and reported on stderr.
+- The retry pass stops with an error after 5 consecutive failures, or once at least 20 tickers have failed and they are more than half of those attempted. Either pattern usually means the source is blocking or rate-limiting.
 
 ### Privacy
 
 The plugin collects no user data and transmits none: there is no telemetry, analytics or account, and nothing you screen or render is uploaded anywhere. In live mode the scripts fetch public market data directly from the services listed above, with no intermediary. The only other network traffic is the interactive page loading three.js from cdn.jsdelivr.net, and the page's external links (Google Finance, SEC EDGAR, company websites), which open only when you click them. Results stay in local files that you choose (`out/` by default).
+
+The full policy is in [PRIVACY.md](PRIVACY.md). For help, see [SUPPORT.md](SUPPORT.md), and for release notes see [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -116,13 +127,13 @@ claude --plugin-dir /path/to/sharpe-observatory    # load from a local checkout 
 Or, inside Claude Code, from the marketplace this repository hosts (`.claude-plugin/marketplace.json`, marketplace name `quant-3d-sharpe-viz`). The one-line form needs Claude Code v2.1.275 or later:
 
 ```
-/plugin install sharpe-observatory --marketplace rajib2k5/quant-3d-sharpe-viz
+/plugin install sharpe-observatory --marketplace rajib2k5/quant-3d-sharpe-viz-claude-plugin
 ```
 
 On older versions, add the marketplace first and then install from it:
 
 ```bash
-claude plugin marketplace add rajib2k5/quant-3d-sharpe-viz
+claude plugin marketplace add rajib2k5/quant-3d-sharpe-viz-claude-plugin
 claude plugin install sharpe-observatory@quant-3d-sharpe-viz
 ```
 
@@ -144,7 +155,7 @@ python scripts/screen.py --live --save-universe sp500.csv --window 756 --top 20 
 python scripts/screen.py --live --limit-universe 10 --out out/       # quick check: first 10 names only
 ```
 
-A full run makes one Yahoo request per name (about 500). A 10-name live test took about 10 seconds end to end, so expect very roughly 8 to 10 minutes for the full list, and longer if Yahoo slows down.
+Prices for the full list (about 500 names) download in chunks of 50 per call, with the symbols in a chunk fetched in parallel. In a 12-ticker live test in chunks of 5, the batched download took 3.6 seconds. Expect the full list to take minutes rather than hours, and longer if Yahoo slows down.
 
 ### Full US market (`--index us-all`)
 

@@ -42,14 +42,39 @@ import metrics
 from fetch_data import INDEXES, SAMPLE_DIR, THROTTLE_S, Dataset, fetch_live, live_universe, load_directory
 
 DSR_THRESHOLD = 0.95
+REPORT_WARNING = ("> **Not financial advice.** Historical statistics for research and education only; not a "
+                  "recommendation to buy, sell or hold any security. Past Sharpe ratios and alphas do not predict future results.")
+
+
+def raw_returns(dataset: Dataset) -> pd.DataFrame:
+    """Daily total return on the price calendar (NaN where a name has no price)."""
+    return dataset.prices.pct_change(fill_method=None).iloc[1:]
 
 
 def excess_returns(dataset: Dataset) -> pd.DataFrame:
     """Daily total return minus daily risk-free, on the price calendar (NaN where a name has no price)."""
+    returns = raw_returns(dataset)
     calendar = dataset.prices.index
-    returns = dataset.prices.pct_change(fill_method=None).iloc[1:]
     rf = dataset.rf_daily.reindex(dataset.rf_daily.index.union(calendar)).ffill().reindex(returns.index)
     return returns.sub(rf, axis=0)
+
+
+STALE_ZERO_SHARE = 0.5
+
+
+def unscoreable_reason(raw_window: np.ndarray, sr: float) -> str | None:
+    """Data-quality rule (an implementation choice, not from the papers): a name that meets the
+    coverage rule is still not scored in a window when its raw daily returns there have zero
+    variance ("flat price"), when more than STALE_ZERO_SHARE of them are exactly zero ("stale
+    quotes": halted or unrefreshed prices), or when its Sharpe is not finite. Excess returns of
+    such a name are just minus the risk-free rate, whose tiny variance makes the Sharpe explode."""
+    if raw_window.size and np.ptp(raw_window) == 0:
+        return "flat price"
+    if raw_window.size and np.mean(raw_window == 0) > STALE_ZERO_SHARE:
+        return "stale quotes"
+    if not math.isfinite(sr):
+        return "non-finite Sharpe"
+    return None
 
 
 def window_labels(selected: int) -> dict[str, int]:
@@ -106,6 +131,7 @@ def _alpha_fields(prefix: str, result: metrics.OLSResult | None) -> dict[str, fl
 
 def screen(dataset: Dataset, window: int, top: int) -> dict[str, Any]:
     excess = excess_returns(dataset)
+    raw = raw_returns(dataset)
     labels = window_labels(window)
     selected_label = next(label for label, days in labels.items() if days == window)
     factors = dataset.factors.reindex(excess.index)
@@ -115,21 +141,24 @@ def screen(dataset: Dataset, window: int, top: int) -> dict[str, Any]:
     horizons: dict[str, dict[str, Any]] = {}
     sr_ann: dict[str, dict[str, float]] = {t: {} for t in excess.columns}
     for label, days in labels.items():
-        srs, ns, nonfinite = [], [], []
+        srs, ns, unscoreable = [], [], {}
         for ticker in excess.columns:
             observed = metrics.window_excess(excess[ticker], days)
             sr = math.nan if observed is None else metrics.sharpe_ratio(observed)
-            # A name can meet coverage yet have no finite SR (e.g. a constant price, std 0);
-            # it stays out of N and the plane's cross-section, and is left unranked.
-            if observed is not None and not math.isfinite(sr):
-                nonfinite.append(ticker)
+            # A covered name can still be unscoreable (flat or stale prices, non-finite SR): it
+            # stays out of N and the plane's cross-section, and is left unranked.
+            reason = None if observed is None else unscoreable_reason(raw[ticker].iloc[-days:].dropna().to_numpy(), sr)
+            if reason is not None:
+                unscoreable[ticker] = reason
+                sr = math.nan
             sr_ann[ticker][label] = sr * math.sqrt(metrics.TRADING_DAYS) if math.isfinite(sr) else math.nan
             if math.isfinite(sr):
                 srs.append(sr)
                 ns.append(observed.size)
-        horizons[label] = {**luck_horizon(srs, ns), "excluded_nonfinite": sorted(nonfinite)}
+        horizons[label] = {**luck_horizon(srs, ns), "excluded_unscoreable": dict(sorted(unscoreable.items()))}
 
     headline = horizons[selected_label]
+    uncovered = sorted(t for t in excess.columns if metrics.window_excess(excess[t], window) is None)
     if headline["n_trials"] < 2:
         raise RuntimeError(f"fewer than two tickers have {window} days of data at {metrics.MIN_COVERAGE:.0%} coverage")
     e_max = headline["headline_per_period"]
@@ -142,7 +171,7 @@ def screen(dataset: Dataset, window: int, top: int) -> dict[str, Any]:
         row: dict[str, Any] = {"ticker": ticker, "sector": sectors.get(ticker, "Unclassified"), "sr_ann": sr_ann[ticker]}
         if websites.get(ticker):
             row["website"] = websites[ticker]
-        if observed is None:
+        if observed is None or ticker in headline["excluded_unscoreable"]:
             row.update({"n_obs": int(series.iloc[-window:].notna().sum()), "sr_per_period": None, "skew": None,
                         "kurtosis_pearson": None, "psr": None, "dsr": None,
                         **_alpha_fields("capm", None), **_alpha_fields("ff3", None)})
@@ -189,7 +218,8 @@ def screen(dataset: Dataset, window: int, top: int) -> dict[str, Any]:
             "windows": labels,
             "min_coverage": metrics.MIN_COVERAGE,
             "N": headline["n_trials"],
-            "excluded_nonfinite": headline["excluded_nonfinite"],
+            "excluded_unscoreable": headline["excluded_unscoreable"],
+            "excluded_coverage": {"count": len(uncovered), "tickers": uncovered},
             "universe_size": len(rows),
             "top_n": len(top_rows),
             "rank_by": f"sr_ann[{selected_label}]",
@@ -226,6 +256,31 @@ def _fmt(value: float | None, spec: str) -> str:
     return "n/a" if value is None else format(value, spec)
 
 
+REASONS = ("flat price", "stale quotes", "non-finite Sharpe")
+LISTED = 20
+
+
+def _names(tickers: list[str]) -> str:
+    shown = ", ".join(tickers[:LISTED])
+    return shown + (f" and {len(tickers) - LISTED} more" if len(tickers) > LISTED else "")
+
+
+def exclusion_lines(meta: dict[str, Any]) -> list[str]:
+    """The report's account of every name left out of the screened window, and why."""
+    coverage = meta["excluded_coverage"]
+    unscoreable = meta["excluded_unscoreable"]
+    lines = [f"## Exclusions ({meta['window_label']})", "",
+             f"- Coverage: {coverage['count']} name{'s' if coverage['count'] != 1 else ''} with less than "
+             f"{meta['min_coverage']:.0%} of the window's trading days"
+             + (f": {_names(coverage['tickers'])}." if coverage["count"] else ".")]
+    by_reason = {reason: sorted(t for t, r in unscoreable.items() if r == reason) for reason in REASONS}
+    lines.append(f"- Unscoreable: {len(unscoreable)} name{'s' if len(unscoreable) != 1 else ''} "
+                 "(data-quality rule, see the README): "
+                 + ", ".join(f"{reason} {len(names)}" for reason, names in by_reason.items()) + ".")
+    lines += [f"  - {reason}: {_names(names)}." for reason, names in by_reason.items() if names]
+    return lines + [""]
+
+
 def render_report(result: dict[str, Any]) -> str:
     meta = result["metadata"]
     lh = meta["luck_horizon_ann"]
@@ -233,6 +288,8 @@ def render_report(result: dict[str, Any]) -> str:
     top = result["top"]
     lines = [
         "# Sharpe Observatory screen",
+        "",
+        REPORT_WARNING,
         "",
         f"**{meta['N']} names screened** over the trailing {meta['window']} trading days ({label}), "
         f"data {meta['data_start']} to {meta['data_end']} ({meta['data_mode']} data).",
@@ -263,6 +320,7 @@ def render_report(result: dict[str, Any]) -> str:
         )
     lines += [
         "",
+        *exclusion_lines(meta),
         "## How to read this",
         "",
         "- **Sharpe** is average daily return above the risk-free rate divided by its daily standard deviation, "

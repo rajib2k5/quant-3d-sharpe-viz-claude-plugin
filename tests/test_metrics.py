@@ -881,11 +881,11 @@ def _run_nav_logic(page: str, expression: str) -> object:
 
 def test_page_navigation_markup(screen_runs: tuple[Path, Path], tmp_path: Path):
     page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
-    assert ('<p id="controls-hint" class="caption">Drag floor to move \u00b7 drag sky to orbit \u00b7 scroll to zoom \u00b7 '
-            'double-click a bar to fly to it \u00b7 R resets.') in page
+    assert ('<p id="controls-hint" class="caption">Drag the city to move \u00b7 drag sky to orbit \u00b7 scroll to zoom \u00b7 '
+            'double-click a bar to fly to it \u00b7 R resets \u00b7 Layout: sector / by Sharpe \u00b7 zoom in to label nearby bars.') in page
     assert '<button id="reset-view" type="button">Reset view</button>' in page
     assert '<button id="fly-to" type="button">Fly to</button>' in page
-    assert re.search(r'addEventListener\("dblclick", \(event\) => \{\s*const mesh = towerAt\(event\);\s*'
+    assert re.search(r'stage\.addEventListener\("dblclick", \(event\) => \{\s*const mesh = towerAt\(event\);\s*'
                      r'clearTimeout\(clickTimer\);\s*if \(mesh\) select\(mesh, true\);', page)
     assert "if (mesh) clickTimer = setTimeout(() => select(mesh, false), DOUBLE_CLICK_MS);" in page
     assert "controls.screenSpacePanning = false;" in page
@@ -902,7 +902,7 @@ def test_page_navigation_logic(screen_runs: tuple[Path, Path], tmp_path: Path):
         {"x": 1, "y": 2, "z": -3}, {"x": 12.2, "y": -5.5791, "z": -12.2}]
     assert _run_nav_logic(page, '[N.dragMode(0, "floor"), N.dragMode(0, "tower"), N.dragMode(0, null), '
                                 'N.dragMode(2, "tower"), N.dragMode(2, null), N.dragMode(1, "floor")]') == [
-        "pan", "orbit", "orbit", "pan", "pan", None]
+        "pan", "pan", "orbit", "pan", "pan", None]
     # Looking down -z: up/W move forward (-z), D moves right (+x), A left; S along -(0.6, 0.8) x 10.
     assert _run_nav_logic(page, '[N.keyPan("ArrowUp", {x: 0, z: -2}, 1), N.keyPan("W", {x: 0, z: -2}, 1), '
                                 'N.keyPan("d", {x: 0, z: -2}, 1), N.keyPan("ArrowLeft", {x: 0, z: -2}, 1), '
@@ -1384,7 +1384,7 @@ def test_nonfinite_sharpe_is_excluded_from_the_plane(tmp_path: Path):
     dataset = fetch_data.load_directory(_hygiene_dir(tmp_path))
     result = screen.screen(dataset, window=252, top=5)
     meta = result["metadata"]
-    assert meta["excluded_nonfinite"] == ["FLAT"]
+    assert meta["excluded_unscoreable"] == {"FLAT": "flat price"}
     assert meta["N"] == 31 and meta["universe_size"] == 32
     assert math.isfinite(meta["luck_horizon_ann"]["headline"]) and math.isfinite(meta["luck_horizon_ann"]["cross_sectional"])
     flat = next(r for r in result["universe"] if r["ticker"] == "FLAT")
@@ -1406,3 +1406,250 @@ def test_summary_print_survives_missing_plane(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(screen, "screen", plane_missing)
     assert screen.main(["--data-dir", str(data_dir), "--window", "252", "--top", "5", "--out", str(tmp_path / "b")]) == 0
     assert "N=31 luck_plane_ann=n/a top 5:" in capsys.readouterr().out
+
+
+# --- 10. "By Sharpe" layout ------------------------------------------------------------
+
+def test_page_layout_toggle_markup(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    data = _page_data(page)
+    assert '<button type="button" data-layout="sector" aria-pressed="true">By sector</button>' in page
+    assert '<button type="button" data-layout="rank" aria-pressed="false">By Sharpe</button>' in page
+    assert '<div id="layout-note" class="panel" hidden></div>' in page
+    assert 'note.textContent = `sorted by Sharpe (${current})`;' in page
+    assert 'navBounds = layout === "rank" ? DATA.nav_bounds_rank : DATA.nav_bounds;' in page
+    assert "const c = SkylineNav.clampTarget(t, navBounds);" in page
+    assert 'for (const item of sectorDecor) item.visible = layout === "sector";' in page
+    assert "if (k === 1) { shuffle = null; towerMesh.computeBoundingSphere(); }" in page
+    assert 'if (layout === "rank") { updateLayoutNote(); arrange(800); }' in page
+    # 60 names: ceil(sqrt(60)) = 8 columns of pitch 1.4 -> half-width 8 * 1.4 / 2 + 1.5 + 2 = 9.1.
+    assert data["rank_layout"] == {"cols": 8, "pitch": 1.4}
+    assert data["nav_bounds_rank"] == {"x": [-9.1, 9.1], "y": [-5.5791, 10.1582], "z": [-9.1, 9.1]}
+    assert data["floor_extent"] == {"width": 17.4, "depth": 17.4}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js to run the page's layout logic")
+def test_rank_layout_order_and_serpentine(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    # Sharpe: B 3 > D 2 > A 1 > E 0.5 > F 0.5 (tie, by ticker) > C NaN > G null (missing last, by
+    # ticker). 2 columns, pitch 1: rows 0..3 (z = 1.5 - row), x = 0.5 - col; odd rows (1, 3) are
+    # reversed, so G, alone in row 3, lands in column 1.
+    cells = _run_nav_logic(page, 'N.rankLayout([{ticker: "A", sr: 1}, {ticker: "B", sr: 3}, {ticker: "C", sr: NaN}, '
+                                 '{ticker: "D", sr: 2}, {ticker: "F", sr: 0.5}, {ticker: "E", sr: 0.5}, '
+                                 '{ticker: "G", sr: null}], 2, 1)')
+    assert [(c["ticker"], c["row"], c["col"], c["x"], c["z"]) for c in cells] == [
+        ("B", 0, 0, 0.5, 1.5), ("D", 0, 1, -0.5, 1.5),
+        ("A", 1, 1, -0.5, 0.5), ("E", 1, 0, 0.5, 0.5),
+        ("F", 2, 0, 0.5, -0.5), ("C", 2, 1, -0.5, -0.5),
+        ("G", 3, 1, -0.5, -1.5),
+    ]
+
+
+# --- 11. Publishing assets and docs ----------------------------------------------------
+
+def test_icon_is_deterministic_and_sized(tmp_path: Path):
+    import make_icon
+
+    first = make_icon.write_icons(tmp_path / "a")
+    second = make_icon.write_icons(tmp_path / "b")
+    for a, b in zip(first, second):
+        assert a.read_bytes() == b.read_bytes()
+    for path, size in zip(first, (512, 128)):
+        data = path.read_bytes()
+        assert data[:8] == b"\x89PNG\r\n\x1a\n"
+        assert (int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")) == (size, size)
+        assert (REPO / "assets" / path.name).read_bytes() == data  # the committed icon is the generator's output
+
+
+def test_publishing_docs_exist_and_links_resolve():
+    for name in ("README.md", "PRIVACY.md", "SUPPORT.md", "CHANGELOG.md", "LICENSE", "docs/SUBMISSION.md"):
+        assert (REPO / name).is_file(), name
+    for doc in ("README.md", "PRIVACY.md", "SUPPORT.md", "CHANGELOG.md", "docs/SUBMISSION.md"):
+        text = (REPO / doc).read_text()
+        targets = re.findall(r"\]\(([^)\s]+)\)", text) + re.findall(r'src="([^"]+)"', text)
+        local = [t for t in targets if not t.startswith(("http://", "https://", "#", "mailto:"))]
+        for target in local:
+            assert ((REPO / doc).parent / target).is_file(), f"{doc} links to missing {target}"
+    readme = (REPO / "README.md").read_text()
+    for link in ("PRIVACY.md", "SUPPORT.md", "CHANGELOG.md", "assets/icon-512.png"):
+        assert link in readme
+    manifest = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text())
+    assert manifest["repository"] == "https://github.com/rajib2k5/quant-3d-sharpe-viz-claude-plugin"
+
+
+# --- 12. Zoom-aware ticker labels ------------------------------------------------------
+
+def test_page_label_toggle_markup(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    assert '<button id="labels-toggle" type="button" aria-pressed="true" title="Ticker labels in the scene">Labels</button>' in page
+    assert _page_data(page)["label_lod"] == {"always_top": 20, "budget": 100, "max_distance": 24.0, "full_distance": 14.0,
+                                             "full_scale": 0.25, "max_scale": 0.45, "candidates": 400,
+                                             "declutter": {"char_width": 7, "padding": 10, "height": 18, "cell": 64}}
+    assert "maxDistance: labelFade.maxDistance, fullDistance: labelFade.fullDistance" in page
+    assert "labelFade = SkylineNav.labelFade(framedDistance, DATA.label_lod);" in page
+    assert re.search(r"clampView\(\);\s*updateLabels\(\);\s*renderer\.render", page)
+    assert 'if (t.top) handle.userData.label = label(t.ticker, glow ? "label" : "label dim", t.x, 0, -t.y);' in page
+    assert "own.visible = placed.has(handle.userData.tower.ticker);" in page
+    assert "const placed = new Set(SkylineNav.declutter(candidates, { budget: lod.budget," in page
+    assert "const candidates = selected ? [candidate(selected, true)] : [];" in page
+    assert "camera.position, viewProj, { alwaysTop: lod.always_top, budget: lod.candidates," in page
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js to run the page's label logic")
+def test_label_selection_logic(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    # Camera at the origin looking down -z: view = identity, projection = 90 degree FOV, aspect 1,
+    # near 0.1, far 100 (column-major), so NDC = (x / -z, y / -z). Always the top 2 ranks; budget 4;
+    # fade 5 -> 10 units. A (rank 1, far) and B (rank 2, behind the camera) are always labelled;
+    # C (d 3) is near at full opacity; D (d 7) fades to (10 - 7) / (10 - 5) = 0.6; E (d 8) is cut
+    # by the budget; F is behind the camera; G (d 12) is beyond maxDistance; H (d 5.83) is close but
+    # below the frame (NDC y = -5 / 3), so it must not take D's place.
+    proj = "[1,0,0,0, 0,1,0,0, 0,0,-1.002002002002002,-1, 0,0,-0.2002002002002002,0]"
+    picks = _run_nav_logic(page, 'N.pickLabels(['
+                                 '{ticker: "E", rank: null, x: 0, y: 0, z: -8}, {ticker: "A", rank: 1, x: 0, y: 0, z: -100}, '
+                                 '{ticker: "G", rank: 7, x: 0, y: 0, z: -12}, {ticker: "D", rank: null, x: 0, y: 0, z: -7}, '
+                                 '{ticker: "F", rank: null, x: 0, y: 0, z: 2}, {ticker: "C", rank: 3, x: 0, y: 0, z: -3}, '
+                                 '{ticker: "H", rank: null, x: 0, y: -5, z: -3}, '
+                                 '{ticker: "B", rank: 2, x: 0, y: 0, z: 5}], {x: 0, y: 0, z: 0}, ' + proj + ', '
+                                 '{alwaysTop: 2, budget: 4, maxDistance: 10, fullDistance: 5})')
+    assert picks == [{"ticker": "A", "opacity": 1}, {"ticker": "B", "opacity": 1},
+                     {"ticker": "C", "opacity": 1}, {"ticker": "D", "opacity": 0.6}]
+
+
+def test_flat_and_stale_prices_are_unscoreable(tmp_path: Path):
+    # FLAT: every close equal. STALE: 60% of window returns exactly zero (halted / unrefreshed
+    # quotes). PARTLY: 40% zero; HALF: exactly 50% zero (the rule is "more than 50%"), both scored.
+    # SHORT: no prices for the first 100 days, so it fails the 90% coverage rule. The risk-free rate
+    # varies over time, so FLAT's excess returns are not constant: only the raw-return test sees it.
+    rng = np.random.default_rng(9)
+    dates = pd.bdate_range("2024-01-01", periods=301, name="date")
+    returns = pd.DataFrame(rng.normal(0.0005, 0.01, (300, 30)), index=dates[1:], columns=[f"N{i:02d}" for i in range(30)])
+    stale = rng.normal(0.0005, 0.01, 300)
+    stale[rng.permutation(300)[:180]] = 0.0
+    partly = rng.normal(0.0005, 0.01, 300)
+    partly[rng.permutation(300)[:120]] = 0.0
+    half = rng.normal(0.0005, 0.01, 300)
+    half[48 + rng.permutation(252)[:126]] = 0.0  # exactly 126 of the window's 252 returns
+    returns["STALE"], returns["PARTLY"], returns["HALF"] = stale, partly, half
+    returns["SHORT"] = rng.normal(0.0005, 0.01, 300)
+    prices = pd.concat([pd.DataFrame(100.0, index=dates[:1], columns=returns.columns), 100 * (1 + returns).cumprod()])
+    prices.loc[dates[:100], "SHORT"] = np.nan
+    prices["FLAT"] = 50.0
+    rf = pd.Series(0.0001 + 0.00005 * np.sin(np.arange(301) / 10.0), index=dates)
+    dataset = fetch_data.Dataset(
+        universe=pd.DataFrame({"ticker": list(prices.columns), "sector": "Test"}),
+        prices=prices, rf_daily=rf,
+        factors=pd.DataFrame(rng.normal(0.0, 0.01, (300, 3)), index=dates[1:], columns=["mkt_rf", "smb", "hml"]),
+        mode="test",
+    )
+    result = screen.screen(dataset, window=252, top=5)
+    meta = result["metadata"]
+    assert meta["excluded_unscoreable"] == {"FLAT": "flat price", "STALE": "stale quotes"}
+    assert meta["excluded_coverage"] == {"count": 1, "tickers": ["SHORT"]}
+    assert meta["N"] == 32 and meta["universe_size"] == 35
+    plane = meta["luck_horizon_ann"]["headline"]
+    assert math.isfinite(plane) and 0 < plane < 5
+    rows = {r["ticker"]: r for r in result["universe"]}
+    assert rows["FLAT"]["rank"] is None and rows["STALE"]["rank"] is None and rows["STALE"]["dsr"] is None
+    assert rows["PARTLY"]["rank"] is not None and rows["HALF"]["rank"] is not None and rows["SHORT"]["rank"] is None
+    page = scene_threejs.render_page(scene_threejs.build_scene(screen._nan_to_none(result)))
+    ticks = _page_data(page)["ruler_ticks"]
+    assert ticks[0] >= -5 and ticks[-1] <= 5  # the ruler is not stretched by a degenerate Sharpe
+    report = screen.render_report(screen._nan_to_none(result))
+    assert ("## Exclusions (1y)\n\n"
+            "- Coverage: 1 name with less than 90% of the window's trading days: SHORT.\n"
+            "- Unscoreable: 2 names (data-quality rule, see the README): flat price 1, stale quotes 1, non-finite Sharpe 0.\n"
+            "  - flat price: FLAT.\n"
+            "  - stale quotes: STALE.\n") in report
+
+
+# --- 13. Release-gate fixes --------------------------------------------------------------
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js to run the page's zoom logic")
+def test_zoom_limits_keep_the_scene_in_view(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    limits = _run_nav_logic(page, "N.distanceLimits(40, 13)")
+    # framed 40, scene radius 13: max 3 x 40 = 120; fog from 40 + 13 = 53 to 53 + (120 - 53) / 0.35.
+    assert limits["minDistance"] == 2 and limits["maxDistance"] == 120 and limits["fogNear"] == 53
+    assert limits["fogFar"] == pytest.approx(244.42857142857142, abs=1e-9)
+    assert (limits["maxDistance"] - limits["fogNear"]) / (limits["fogFar"] - limits["fogNear"]) == pytest.approx(0.35)
+    diagonal = 2 * 13
+    assert limits["far"] > limits["maxDistance"] + diagonal and limits["far"] >= limits["fogFar"]
+    assert "const framedDistance = framedPosition().distanceTo(home);" in page
+    assert "const limits = SkylineNav.distanceLimits(framedDistance, sceneRadius);" in page
+    assert "controls.maxDistance = limits.maxDistance;" in page and "camera.far = limits.far;" in page
+    assert re.search(r"camera\.updateProjectionMatrix\(\);\s*applyDistanceLimits\(\);", page)
+
+
+def test_page_fly_to_and_panel_fixes(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    assert "const aim = SkylineNav.flyTarget(mesh.position, shuffle ? shuffle.to[mesh.index] : null, signed);" in page
+    assert "#details { position: relative; flex: 0 1 auto; min-height: 0; max-height: calc(100vh - 32px); overflow-y: auto; }" in page
+    assert '<p id="verdict-warning" class="caption">Not financial advice: historical statistics only.</p>' in page
+
+
+def test_every_remote_host_is_disclosed():
+    hosts = set()
+    for path in sorted((REPO / "scripts").glob("*.py")):
+        hosts.update(re.findall(r"https?://([A-Za-z0-9.-]+)", path.read_text()))
+    assert {"raw.githubusercontent.com", "en.wikipedia.org", "www.nasdaqtrader.com", "fred.stlouisfed.org",
+            "mba.tuck.dartmouth.edu", "cdn.jsdelivr.net", "www.google.com", "www.sec.gov"} <= hosts
+    for doc in ("PRIVACY.md", "docs/SUBMISSION.md"):
+        text = (REPO / doc).read_text()
+        missing = sorted(h for h in hosts if h not in text)
+        assert not missing, f"{doc} does not disclose {missing}"
+
+
+def test_not_financial_advice_warnings(screen_runs: tuple[Path, Path]):
+    readme = (REPO / "README.md").read_text()
+    alert = readme.index("> [!WARNING]\n> **Not financial advice.**")
+    assert alert < readme.index("![")
+    assert readme.splitlines()[0].startswith("# ") and readme.splitlines()[2] == "> [!WARNING]"
+    report = (screen_runs[0] / "report.md").read_text().splitlines()
+    assert report[2] == ("> **Not financial advice.** Historical statistics for research and education only; not a "
+                         "recommendation to buy, sell or hold any security. Past Sharpe ratios and alphas do not predict "
+                         "future results.")
+    for skill in ("skills/sharpe-screen/SKILL.md", "skills/sharpe-skyline/SKILL.md"):
+        assert "**Not financial advice:**" in (REPO / skill).read_text()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js to run the page's view logic")
+def test_view_guards_and_label_fade(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    data = _page_data(page)
+    # Orbit stays above the horizon: max polar = pi/2 - 0.08 = 1.490796; camera never below y = 0.5.
+    assert data["polar"] == {"min": 0.05, "max": 1.490796, "camera_min_y": 0.5}
+    assert "controls.minPolarAngle = DATA.polar.min;" in page and "controls.maxPolarAngle = DATA.polar.max;" in page
+    assert "const above = SkylineNav.cameraAboveFloor(camera.position, DATA.polar.camera_min_y);" in page
+    assert _run_nav_logic(page, "[N.cameraAboveFloor({x: 1, y: -3.4, z: 2}, 0.5), N.cameraAboveFloor({x: 1, y: 7, z: 2}, 0.5)]") == [
+        {"x": 1, "y": 0.5, "z": 2}, {"x": 1, "y": 7, "z": 2}]
+    # Label fade: absolute floors (14, 24) for a small scene; 0.25x / 0.45x the reset distance for a big one.
+    lod = json.dumps(data["label_lod"])
+    assert _run_nav_logic(page, f"[N.labelFade(40, {lod}), N.labelFade(400, {lod})]") == [
+        {"fullDistance": 14, "maxDistance": 24}, {"fullDistance": 100, "maxDistance": 180}]
+    # Fly-to aims at the resting place during a layout transition, at the current place otherwise;
+    # the target height is the middle of the tower (negative towers hang below 0).
+    assert _run_nav_logic(page, "[N.flyTarget({x: 1, y: 0, z: 2}, {x: 5, y: 0, z: 6}, 3), "
+                                "N.flyTarget({x: 1, y: -2, z: 2}, null, -2)]") == [
+        {"x": 5, "y": 1.5, "z": 6}, {"x": 1, "y": -1, "z": 2}]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js to run the page's declutter logic")
+def test_label_declutter_priorities(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    # Boxes: width = len(ticker) * 7 + 10, height 15 (fixture value), centred on (x, y). Pairs (SEL, AAA) and
+    # (BBB, CCC) overlap; DDD and EEE overlap nothing. SEL (selected) beats AAA (rank 1); BBB
+    # (rank 2) beats CCC (nearer, but unranked); DDD and EEE are placed nearest-first.
+    candidates = ('['
+                  '{ticker: "EEE", x: 700, y: 100, selected: false, top: false, rank: null, distance: 9}, '
+                  '{ticker: "CCC", x: 305, y: 102, selected: false, top: false, rank: null, distance: 5}, '
+                  '{ticker: "AAA", x: 105, y: 100, selected: false, top: true, rank: 1, distance: 50}, '
+                  '{ticker: "DDD", x: 500, y: 100, selected: false, top: false, rank: null, distance: 3}, '
+                  '{ticker: "BBB", x: 300, y: 100, selected: false, top: true, rank: 2, distance: 60}, '
+                  '{ticker: "SEL", x: 100, y: 100, selected: true, top: false, rank: 300, distance: 80}]')
+    opts = "{charWidth: 7, padding: 10, height: 15, cell: 64, budget: %d}"
+    assert _run_nav_logic(page, f"N.declutter({candidates}, {opts % 100})") == ["SEL", "BBB", "DDD", "EEE"]
+    assert _run_nav_logic(page, f"N.declutter({candidates}, {opts % 3})") == ["SEL", "BBB", "DDD"]
+    # A measured width overrides the estimate: WIDE (rank 3, 300 px of text) reaches EEE at x 700.
+    wide = candidates[:-1] + ', {ticker: "WIDE", x: 560, y: 100, selected: false, top: true, rank: 3, distance: 70, width: 300}]'
+    assert _run_nav_logic(page, f"N.declutter({wide}, {opts % 100})") == ["SEL", "BBB", "WIDE"]

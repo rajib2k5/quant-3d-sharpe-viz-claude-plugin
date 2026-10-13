@@ -88,10 +88,15 @@ def build_figure(result: dict[str, Any], window: str | None = None) -> tuple[plt
 
     ranked = sorted((t for t in towers if t["rank"] is not None), key=lambda t: t["rank"])
     labelled = [t["ticker"] for t in ranked[:LABELLED_TOP]]
+    z_span = max(max(heights), plane_z) - min(min(heights), 0.0)
     for i, tower in enumerate(ranked[:LABELLED_TOP]):
-        top_z = max(tower["sr_ann"][window] or 0.0, 0.0) + (0.22 * (i % 4) if crowded else 0.0)
-        ax.text(tower["x"], tower["y"], top_z + 0.12, tower["ticker"], color=TEXT, fontsize=8,
-                fontweight="bold", ha="center", va="bottom", zorder=5)
+        top_z = max(tower["sr_ann"][window] or 0.0, 0.0)
+        # Crowded scenes put the leaders next to each other: fan their labels out in height
+        # and alternate them left and right of the tower so they don't print on top of each other.
+        if crowded:
+            top_z += 0.07 * z_span * (i % 5)
+        ax.text(tower["x"], tower["y"], top_z + 0.12, tower["ticker"], color=TEXT, fontsize=8, fontweight="bold",
+                ha=("right" if i % 2 else "left") if crowded else "center", va="bottom", zorder=5)
     for sector in scene["sectors"]:
         ax.text(sector["x"], sector["y"] - 0.6, 0.0, sector["name"], color=MUTED, fontsize=7, ha="center", va="top",
                 zorder=4)

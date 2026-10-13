@@ -8,7 +8,7 @@
     {
       "name": "sharpe-observatory",
       "source": "./",
-      "description": "Screen a stock universe by Sharpe ratio and Jensen's alpha with a multiple-testing luck correction (Probabilistic and Deflated Sharpe), then render the result as a 3D skyline in Blender or three.js. Offline sample data by default; not investment advice."
+      "description": "Screen a stock universe (bundled sample, S&P 500 or the full US market) by Sharpe ratio and Jensen's alpha with a multiple-testing luck correction (Probabilistic and Deflated Sharpe), then render the result as a 3D skyline: a PNG via matplotlib or Blender, or an interactive three.js page. Offline sample data by default; not investment advice."
     }
   ]
 }
