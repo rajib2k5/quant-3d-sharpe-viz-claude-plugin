@@ -7,5 +7,8 @@
   },
   "homepage": "https://github.com/rajib2k5/quant-3d-sharpe-viz-claude-plugin",
   "repository": "https://github.com/rajib2k5/quant-3d-sharpe-viz-claude-plugin",
+  "documentationUrl": "https://github.com/rajib2k5/quant-3d-sharpe-viz-claude-plugin#readme",
+  "supportUrl": "https://github.com/rajib2k5/quant-3d-sharpe-viz-claude-plugin/blob/main/SUPPORT.md",
+  "privacyPolicyUrl": "https://github.com/rajib2k5/quant-3d-sharpe-viz-claude-plugin/blob/main/PRIVACY.md",
   "license": "MIT"
 }
