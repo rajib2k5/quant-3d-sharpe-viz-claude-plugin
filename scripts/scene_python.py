@@ -28,6 +28,8 @@ from skyline_common import COLOR_STOPS, LUCK_PLANE_RGB, build_scene, load_result
 FIGSIZE_IN = (16.0, 10.0)
 DPI = 100
 LABELLED_TOP = 10
+CROWDED = 1000  # above this many towers: thinner bars, no per-bar edges, staggered labels
+CROWDED_BAR = 0.55
 BACKGROUND = "#0b0d14"
 PANE = (0.06, 0.07, 0.11, 1.0)
 TEXT = "#e8eaf0"
@@ -49,8 +51,9 @@ def build_figure(result: dict[str, Any], window: str | None = None) -> tuple[plt
 
     fig = plt.figure(figsize=FIGSIZE_IN, dpi=DPI, facecolor=BACKGROUND)
     ax = fig.add_axes((0.0, 0.0, 0.86, 1.0), projection="3d", facecolor=BACKGROUND)
-    size = scene["tower_size"]
     towers = scene["towers"]
+    crowded = len(towers) > CROWDED
+    size = scene["tower_size"] * (CROWDED_BAR if crowded else 1.0)
     heights = [t["sr_ann"][window] or 0.0 for t in towers]
 
     # mplot3d depth-sorts within a collection but not between collections, so each tower is
@@ -74,7 +77,8 @@ def build_figure(result: dict[str, Any], window: str | None = None) -> tuple[plt
                     [t["x"] - size / 2 for t, _, _ in segments], [t["y"] - size / 2 for t, _, _ in segments],
                     [z for _, z, _ in segments], size, size, [dz for _, _, dz in segments],
                     color=[t["color"] for t, _, _ in segments], shade=True, zorder=3 if above else 1,
-                    edgecolor=TOP_EDGE if top else OTHER_EDGE, linewidth=1.1 if top else 0.3,
+                    edgecolor=TOP_EDGE if top else OTHER_EDGE,
+                    linewidth=(0.8 if crowded else 1.1) if top else (0.0 if crowded else 0.3),
                 )
 
     half_w = scene["extent"]["width"] / 2 + 1.5
@@ -84,8 +88,8 @@ def build_figure(result: dict[str, Any], window: str | None = None) -> tuple[plt
 
     ranked = sorted((t for t in towers if t["rank"] is not None), key=lambda t: t["rank"])
     labelled = [t["ticker"] for t in ranked[:LABELLED_TOP]]
-    for tower in ranked[:LABELLED_TOP]:
-        top_z = max(tower["sr_ann"][window] or 0.0, 0.0)
+    for i, tower in enumerate(ranked[:LABELLED_TOP]):
+        top_z = max(tower["sr_ann"][window] or 0.0, 0.0) + (0.22 * (i % 4) if crowded else 0.0)
         ax.text(tower["x"], tower["y"], top_z + 0.12, tower["ticker"], color=TEXT, fontsize=8,
                 fontweight="bold", ha="center", va="bottom", zorder=5)
     for sector in scene["sectors"]:
@@ -130,6 +134,7 @@ def build_figure(result: dict[str, Any], window: str | None = None) -> tuple[plt
     stats = {
         "window": window,
         "tower_count": len(towers),
+        "bar_size": size,
         "plane_z": plane_z,
         "outlined": [t["ticker"] for t in towers if t["top"]],
         "labelled": labelled,

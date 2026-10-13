@@ -165,7 +165,8 @@ class OLSResult:
 
     @property
     def alpha_t(self) -> float:
-        return self.alpha / self.alpha_se
+        """alpha / se(alpha); NaN when se is 0 (a perfect fit, e.g. a constant series)."""
+        return self.alpha / self.alpha_se if self.alpha_se > 0 else math.nan
 
     @property
     def alpha_ann(self) -> float:

@@ -91,6 +91,7 @@ Live data is fetched **only** when you pass `--live`, and then only from these p
 
 | Host | What | Endpoint |
 |---|---|---|
+| `www.nasdaqtrader.com` | **`--index us-all` only:** the Nasdaq Trader symbol directory of every US-listed security (see "Full US market" below). Skipped with `--universe` or the default S&P 500 index | `https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt`, `https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt` |
 | `raw.githubusercontent.com` | The universe: current S&P 500 constituents (ticker, GICS sector) from the open [datasets/s-and-p-500-companies](https://github.com/datasets/s-and-p-500-companies) project. Skipped when you pass `--universe` | `https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv` |
 | `en.wikipedia.org` | **Fallback only**, contacted only if the GitHub list cannot be fetched, has a changed schema or has fewer than 400 rows: the constituents table of the Wikipedia article | `https://en.wikipedia.org/wiki/List_of_S%26P_500_companies` |
 | Yahoo Finance: `query1.finance.yahoo.com`, `query2.finance.yahoo.com` | Daily closes adjusted for splits and dividends, via the [yfinance](https://pypi.org/project/yfinance/) library; one ticker at a time, at least 0.5 s apart by default (`--throttle`), slowing down automatically when Yahoo pushes back. To get a session cookie, yfinance may also contact `fc.yahoo.com`, `finance.yahoo.com` and, where Yahoo asks for cookie consent, `guce.yahoo.com` / `consent.yahoo.com` | Yahoo Finance chart API (called by yfinance) |
@@ -145,6 +146,59 @@ python scripts/screen.py --live --limit-universe 10 --out out/       # quick che
 
 A full run makes one Yahoo request per name (about 500). A 10-name live test took about 10 seconds end to end, so expect very roughly 8 to 10 minutes for the full list, and longer if Yahoo slows down.
 
+### Full US market (`--index us-all`)
+
+```bash
+python scripts/screen.py --live --index us-all --cache-dir cache/us-all --out out/us-all/
+python scripts/render_skyline.py out/us-all/screen_result.json --html --open
+```
+
+**Universe.** `--index us-all` screens every US-listed stock from the Nasdaq Trader symbol directory, the files the exchanges' own symbology is published in: `nasdaqlisted.txt` (Nasdaq) and `otherlisted.txt` (NYSE, NYSE American, NYSE Arca, Cboe BZX and others). Filters, applied to both files:
+
+- `Test Issue == N` drops exchange test symbols.
+- `ETF == N` drops ETFs and other exchange-traded products.
+- Symbols containing `$` are dropped (preferred shares and similar).
+- Nasdaq "NextShares" funds are dropped.
+- Securities whose **Security Name** marks them as non-common are dropped:
+  - The words `warrant(s)`, `unit(s)`, `right(s)`, `note(s)`, `preferred` and `trust preferred`, matched case-insensitively as whole words.
+  - Any name containing "depositary shares" but not "American depositary". These plain depositary listings are mostly wrappers around preferred shares.
+  - American depositary shares (ADRs) are common-stock exposure to foreign companies and are kept, unless one of the words above also matches. So "Alibaba … American Depositary Shares" stays, "Bank X Depositary Shares each representing 1/40th … Preferred Stock" goes, "Ajax Capital Units" goes, and "Unitil Corporation" stays.
+- Other-listed symbols use the `ACT Symbol` column. Exchange codes map as N = NYSE, A = NYSE American, P = NYSE Arca, Z = Cboe BZX; any other code is shown as "Other (code)". Everything in `nasdaqlisted.txt` is NASDAQ.
+- The trailing "File Creation Time" line is skipped. The run stops if fewer than 3,000 symbols survive the filters.
+
+Measured against the directory files of 2026-10-12, 7,110 symbols pass the first four filters, and the name filter removes 1,185 of them. The categories overlap: warrants 469, units 348, rights 145, notes 144, preferred 131, trust preferred 3, plus 47 plain "depositary shares" listings, 4 of which only that rule catches. That leaves **5,925 stocks**:
+
+| Exchange | Stocks |
+|---|---|
+| NASDAQ | 3,432 |
+| NYSE | 2,205 |
+| NYSE American | 269 |
+| NYSE Arca | 12 |
+| Cboe BZX | 4 |
+| Other (F) | 3 |
+
+Of 283 names containing "American depositary", 274 are kept as ADRs (BABA, TSM, ASML, SAP and NVO are all in), and 9 are dropped because another word, such as "preferred", also matches. Compared with excluding every "depositary shares" listing, this readmits 267 ADRs. The name filter is a heuristic over the directory's free-text names, not a security-type field.
+
+**Floors are exchanges, not sectors.** No sector data is available at this scale, so in this mode the grouping column holds the **listing exchange**. The `sector` column name is kept so everything downstream works unchanged: each skyline floor is an exchange, and the report's "Sector" column shows the exchange.
+
+**Batched, resumable downloads.**
+- Prices are fetched 50 tickers per `yf.download` call. yfinance still requests each symbol separately, but in parallel threads.
+- Symbols that come back empty go to the one-at-a-time fetch, with its retries, backoff and abort rules.
+- The adaptive throttle runs between chunks, and progress is logged every 10 chunks.
+- With `--cache-dir DIR`, every series is written to `DIR/<ticker>.csv` as it arrives, and tickers already there are skipped. An interrupted run resumes instead of restarting. The cache is never refreshed automatically, so use a new directory (or delete it) for fresh prices.
+
+**Runtime.** In a 12-ticker live test in chunks of 5, the batched download took 3.6 seconds. A full run of about 7,000 symbols has not been timed yet; expect tens of minutes, and use `--cache-dir` so a rate-limit stop can be resumed.
+
+**Survivorship.** The directory lists only today's listings, so the survivorship bias described under Limitations applies here too, and more strongly: delisted and failed companies are absent.
+
+![Sharpe skyline of the S&P 500 from a live run: towers grouped by GICS sector, height is the 3-year annualized Sharpe ratio, colour is the Fama-French 3 alpha t-statistic, with the luck plane for about 500 names](assets/skyline-sp500.png)
+
+*Live S&P 500 run (`--index sp500`, the default).*
+
+![Sharpe skyline of the full US market from a live run: several thousand towers grouped by listing exchange, height is the 3-year annualized Sharpe ratio, with the luck plane for the full universe](assets/skyline-us-all.png)
+
+*Live full US market run (`--index us-all`); floors are listing exchanges.*
+
 To screen your own list instead, pass `--universe` with any CSV that has a `ticker`/`Symbol` column, an optional `sector`/`GICS Sector` column and an optional `website` column (an http/https URL per company, used for the page's "Company website" link; without it the link is a web search). The S&P 500 list is then not fetched:
 
 ```bash
@@ -162,12 +216,13 @@ Run the tests with `pip install pytest==9.1.1` then `python -m pytest tests/ -v`
 - "Build the Sharpe skyline in Blender and show me which towers poke through the luck plane."
 - "Make the three.js skyline page for the 5-year window and explain the colours."
 - "Run a live screen of the S&P 500, but tell me first which sites you'll contact."
+- "Screen the whole US stock market with a resumable cache and show me the skyline by exchange."
 - "Run a live screen on my own ticker list in watchlist.csv."
 
 ## Limitations
 
 - **Historical Sharpe is not a prediction.** A high past Sharpe ratio, even one with DSR >= 0.95, says nothing reliable about future returns.
-- **Survivorship bias.** The live default screens today's S&P 500 list, and a user CSV is usually a current list too; either contains only today's survivors, so companies that were dropped or failed during the window are missing, which inflates historical Sharpe ratios and alphas.
+- **Survivorship bias.** The live default screens today's S&P 500 list, `--index us-all` screens today's listings, and a user CSV is usually a current list too; either contains only today's survivors, so companies that were dropped or failed during the window are missing, which inflates historical Sharpe ratios and alphas.
 - **Classic OLS standard errors.** Alpha t-statistics assume homoskedastic, serially uncorrelated residuals; daily stock returns violate both, so the t-statistics are approximate.
 - **Luck-plane assumptions.** The False Strategy Theorem treats the N names as independent, normally distributed trials. Stocks are correlated, which changes both the effective number of trials and the cross-sectional spread of Sharpe ratios; the net effect on the plane depends on the universe and can go either way. The null is centred on the universe's own average Sharpe, so the screen measures edge relative to the other names, not relative to cash.
 - **Risk-free mismatch.** Sharpe ratios and the dependent variable of the alpha regressions use the FRED 3-month Treasury bill (DGS3MO), while the Fama-French market factor (Mkt-RF) is built with Ken French's 1-month T-bill rate. The two rates usually differ by a few basis points a year; part of that difference lands in the estimated alpha.

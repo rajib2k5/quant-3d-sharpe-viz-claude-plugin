@@ -78,7 +78,7 @@ def build_scene(result: dict[str, Any]) -> dict[str, Any]:
     for b, (sector, members) in enumerate(by_sector.items()):
         bx = (b % block_cols) * (block_size + BLOCK_GAP) - width / 2 + TOWER_PITCH / 2
         by = depth / 2 - (b // block_cols) * (block_depth + BLOCK_GAP) - TOWER_PITCH / 2
-        front = by - math.ceil(len(members) / cols) * TOWER_PITCH
+        front = by - max_rows * TOWER_PITCH  # every block's label on the same front line
         sectors.append({"name": sector, "x": round(bx + (cols - 1) * TOWER_PITCH / 2, 4), "y": round(front, 4)})
         for i, row in enumerate(members):
             towers.append({

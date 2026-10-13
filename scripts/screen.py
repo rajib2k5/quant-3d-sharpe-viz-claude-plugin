@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 import metrics
-from fetch_data import SAMPLE_DIR, THROTTLE_S, Dataset, fetch_live, live_universe, load_directory
+from fetch_data import INDEXES, SAMPLE_DIR, THROTTLE_S, Dataset, fetch_live, live_universe, load_directory
 
 DSR_THRESHOLD = 0.95
 
@@ -115,14 +115,19 @@ def screen(dataset: Dataset, window: int, top: int) -> dict[str, Any]:
     horizons: dict[str, dict[str, Any]] = {}
     sr_ann: dict[str, dict[str, float]] = {t: {} for t in excess.columns}
     for label, days in labels.items():
-        srs, ns = [], []
+        srs, ns, nonfinite = [], [], []
         for ticker in excess.columns:
             observed = metrics.window_excess(excess[ticker], days)
-            sr_ann[ticker][label] = math.nan if observed is None else metrics.annualized_sharpe(observed)
-            if observed is not None:
-                srs.append(metrics.sharpe_ratio(observed))
+            sr = math.nan if observed is None else metrics.sharpe_ratio(observed)
+            # A name can meet coverage yet have no finite SR (e.g. a constant price, std 0);
+            # it stays out of N and the plane's cross-section, and is left unranked.
+            if observed is not None and not math.isfinite(sr):
+                nonfinite.append(ticker)
+            sr_ann[ticker][label] = sr * math.sqrt(metrics.TRADING_DAYS) if math.isfinite(sr) else math.nan
+            if math.isfinite(sr):
+                srs.append(sr)
                 ns.append(observed.size)
-        horizons[label] = luck_horizon(srs, ns)
+        horizons[label] = {**luck_horizon(srs, ns), "excluded_nonfinite": sorted(nonfinite)}
 
     headline = horizons[selected_label]
     if headline["n_trials"] < 2:
@@ -184,6 +189,7 @@ def screen(dataset: Dataset, window: int, top: int) -> dict[str, Any]:
             "windows": labels,
             "min_coverage": metrics.MIN_COVERAGE,
             "N": headline["n_trials"],
+            "excluded_nonfinite": headline["excluded_nonfinite"],
             "universe_size": len(rows),
             "top_n": len(top_rows),
             "rank_by": f"sr_ann[{selected_label}]",
@@ -293,6 +299,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="download data from Yahoo Finance (yfinance), fred.stlouisfed.org and mba.tuck.dartmouth.edu")
     parser.add_argument("--universe", type=Path,
                         help="ticker/sector CSV; with --live it overrides the fetched S&P 500 list")
+    parser.add_argument("--index", choices=INDEXES, default="sp500",
+                        help="with --live and no --universe: sp500 (default) or us-all (every US-listed common stock)")
+    parser.add_argument("--cache-dir", type=Path,
+                        help="with --live, resumable per-ticker price cache: fetched tickers are saved and skipped next run")
     parser.add_argument("--save-universe", type=Path, help="with --live, write the universe used to this CSV")
     parser.add_argument("--limit-universe", type=int, help="with --live, screen only the first N names (debugging)")
     parser.add_argument("--throttle", type=float, default=THROTTLE_S,
@@ -308,18 +318,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.throttle < 0:
         parser.error("--throttle must be >= 0")
 
-    if not args.live and (args.save_universe is not None or args.limit_universe is not None):
-        parser.error("--save-universe and --limit-universe need --live")
+    if not args.live and (args.save_universe is not None or args.limit_universe is not None or args.cache_dir is not None):
+        parser.error("--save-universe, --limit-universe and --cache-dir need --live")
     try:
         if args.live:
-            universe = live_universe(args.universe)
+            universe = live_universe(args.universe, args.index)
             if args.save_universe is not None:
                 args.save_universe.parent.mkdir(parents=True, exist_ok=True)
                 universe.to_csv(args.save_universe, index=False)
                 print(f"saved {len(universe)} names to {args.save_universe}", file=sys.stderr)
             if args.limit_universe is not None:
                 universe = universe.head(args.limit_universe)
-            dataset = fetch_live(universe, throttle_s=args.throttle)
+            dataset = fetch_live(universe, throttle_s=args.throttle, cache_dir=args.cache_dir)
         else:
             dataset = load_directory(args.data_dir, args.universe)
         result = _nan_to_none(screen(dataset, args.window, args.top))
@@ -330,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     (args.out / "report.md").write_text(render_report(result), encoding="utf-8")
     meta = result["metadata"]
     print(
-        f"N={meta['N']} luck_plane_ann={meta['luck_horizon_ann']['headline']:.3f} "
+        f"N={meta['N']} luck_plane_ann={_fmt(meta['luck_horizon_ann']['headline'], '.3f')} "
         f"top {meta['top_n']}: {meta['top_dsr_passing']} with DSR>={meta['dsr_threshold']} -> "
         f"{args.out}/screen_result.json, {args.out}/report.md"
     )

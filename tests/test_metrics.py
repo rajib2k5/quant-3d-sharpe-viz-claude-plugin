@@ -509,7 +509,7 @@ def test_sp500_fallback_used_when_primary_fails():
         fetch_data.fetch_sp500_universe([("primary", primary_down), ("fallback", lambda: _big_universe(399, "F"))])
 
 
-def _sample_live_stub(universe: pd.DataFrame, throttle_s: float = 0.5) -> fetch_data.Dataset:
+def _sample_live_stub(universe: pd.DataFrame, throttle_s: float = 0.5, cache_dir: Path | None = None) -> fetch_data.Dataset:
     assert throttle_s >= 0
     sample = fetch_data.load_directory(fetch_data.SAMPLE_DIR)
     keep = list(universe["ticker"])
@@ -1135,3 +1135,274 @@ def test_real_blender_renders_sample_skyline(screen_runs: tuple[Path, Path], tmp
     png = tmp_path / "skyline.png"
     assert render_skyline.render(screen_runs[0] / "screen_result.json", png).startswith("tier 2")
     assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# --- 8. Full US market universe and batched fetching -----------------------------------
+
+NASDAQ_LISTED = (
+    "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\n"
+    "AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N\n"
+    "QQQ|Invesco QQQ Trust|G|N|N|100|Y|N\n"
+    "ZXZZT|NASDAQ TEST STOCK|G|Y|N|100|N|N\n"
+    "ABC$A|ABC Corp Preferred A|G|N|N|100|N|N\n"
+    "NXTS|Example NextShares Fund|G|N|N|100|N|Y\n"
+    "AJAXU|Ajax Capital Acquisition Units|G|N|N|100|N|N\n"
+    "AJAXW|Ajax Capital Acquisition Warrant|G|N|N|100|N|N\n"
+    "AJAXR|Ajax Capital Acquisition Rights|G|N|N|100|N|N\n"
+    "NNCO|NobleNotesCo Inc. - Common Stock|Q|N|N|100|N|N\n"
+    " MSFT |Microsoft Corporation - Common Stock|Q|N|N|100|N|N\n"
+    "File Creation Time: 1012202618:01|||||||\n"
+)
+OTHER_LISTED = (
+    "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\n"
+    "BRK.B|Berkshire Hathaway Inc. New Common Stock|N|BRK.B|N|40|N|BRK.B\n"
+    "SPY|SPDR S&P 500 ETF Trust|P|SPY|Y|100|N|SPY\n"
+    "XYZ|XYZ Corp Common Stock|A|XYZ|N|100|N|XYZ\n"
+    "ARCX|Arca Listed Corp|P|ARCX|N|100|N|ARCX\n"
+    "CBZ|Cboe Listed Corp|Z|CBZ|N|100|N|CBZ\n"
+    "IEXS|IEX Listed Corp|V|IEXS|N|100|N|IEXS\n"
+    "PRF$B|Pref Corp Preferred B|N|PRFpB|N|100|N|PRF-B\n"
+    "TSTX|NYSE Test Stock|N|TSTX|N|100|Y|TSTX\n"
+    "AAC.U|Ajax Capital Units|N|AAC.U|N|100|N|AAC=\n"
+    "ABC.WS|ABC Corp Warrants|N|ABC.WS|N|100|N|ABC+\n"
+    "XYZN|XYZ Corp 5.25% Notes due 2029|N|XYZN|N|100|N|XYZN\n"
+    "PFDX|PFD Corp 6% Series A PREFERRED Stock|N|PFDX|N|100|N|PFDX\n"
+    "BABA|Alibaba Group Holding Limited American Depositary Shares each representing eight Ordinary share|N|BABA|N|100|N|BABA\n"
+    "BKXC|Bank X Depositary Shares each representing 1/40th interest in a share of Preferred Stock Series C|N|BKXC|N|100|N|BKXC\n"
+    "DEPX|Example Co Depositary Shares each representing a 1/1000th interest|N|DEPX|N|100|N|DEPX\n"
+    "ADRP|Example Bank American Depositary Shares each representing one Preferred Share|N|ADRP|N|100|N|ADRP\n"
+    "TPX|Example Capital Trust Preferred Securities|N|TPX|N|100|N|TPX\n"
+    "UTL|Unitil Corporation Common Stock|N|UTL|N|100|N|UTL\n"
+    "File Creation Time: 1012202618:01||||||\n"
+)
+
+
+def test_symbol_directory_footer_is_skipped():
+    frame = fetch_data._read_symbol_directory(NASDAQ_LISTED, "fixture", ["Symbol"])
+    assert len(frame) == 10
+    assert frame["Symbol"].tolist()[-1] == " MSFT "
+    with pytest.raises(ValueError, match=r"^fixture: unexpected schema .*missing \['ETF'\]$"):
+        fetch_data._read_symbol_directory("Symbol|Name\nAAA|A\n", "fixture", ["Symbol", "ETF"])
+
+
+def test_nasdaq_listed_filters():
+    # Kept: AAPL, MSFT (whitespace stripped), NNCO ("NobleNotesCo" has no whole-word "notes").
+    # Dropped: QQQ (ETF), ZXZZT (test issue), ABC$A ("$": preferred), NXTS (NextShares),
+    # AJAXU / AJAXW / AJAXR (units, warrant, rights by name), and the footer line.
+    parsed = fetch_data.parse_nasdaq_listed(NASDAQ_LISTED)
+    assert list(zip(parsed["ticker"], parsed["sector"])) == [("AAPL", "NASDAQ"), ("NNCO", "NASDAQ"), ("MSFT", "NASDAQ")]
+
+
+def test_other_listed_filters_and_exchange_mapping():
+    parsed = fetch_data.parse_other_listed(OTHER_LISTED)
+    # Name filter drops units, warrants, notes, preferred (any case), trust preferred and plain
+    # "Depositary Shares" (BKXC, DEPX). American depositary shares are kept (BABA) unless another
+    # rule matches (ADRP: preferred). "Unitil" contains "unit" but not as a whole word.
+    assert list(zip(parsed["ticker"], parsed["sector"])) == [
+        ("BRK.B", "NYSE"), ("XYZ", "NYSE American"), ("ARCX", "NYSE Arca"), ("CBZ", "Cboe BZX"), ("IEXS", "Other (V)"),
+        ("BABA", "NYSE"), ("UTL", "NYSE")]
+
+
+def test_us_market_universe_sources_and_sanity_bound():
+    def stocks(n: int, prefix: str) -> pd.DataFrame:
+        return pd.DataFrame({"ticker": [f"{prefix}{i:04d}" for i in range(n)], "sector": "NYSE"})
+
+    universe = fetch_data.fetch_us_market_universe([("a", lambda: stocks(1500, "A")), ("b", lambda: stocks(1500, "B"))])
+    assert len(universe) == 3000 and universe["ticker"].iloc[0] == "A0000" and list(universe.columns) == ["ticker", "sector"]
+    with pytest.raises(RuntimeError, match=r"^US market symbol directory: only 2999 stocks after filters, fewer than 3000$"):
+        fetch_data.fetch_us_market_universe([("a", lambda: stocks(1500, "A")), ("b", lambda: stocks(1499, "B"))])
+
+    def down() -> pd.DataFrame:
+        raise requests.ConnectionError("unreachable")
+
+    with pytest.raises(RuntimeError, match=r"^could not fetch the US market symbol directory: a: ConnectionError: "
+                                           r"unreachable; b: ValueError: nasdaqtrader.com nasdaqlisted.txt: unexpected schema "
+                                           r"\['Symbol', 'Name'\]; missing \['Test Issue', 'ETF', 'NextShares'\]$"):
+        fetch_data.fetch_us_market_universe(
+            [("a", down), ("b", lambda: fetch_data.parse_nasdaq_listed("Symbol|Name\nAAA|A\n"))])
+
+
+def test_index_flag_selects_the_universe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    calls: list[str] = []
+    sample_universe = pd.read_csv(fetch_data.SAMPLE_DIR / "universe.csv")
+    monkeypatch.setattr(fetch_data, "fetch_sp500_universe", lambda: (calls.append("sp500"), sample_universe)[1])
+    monkeypatch.setattr(fetch_data, "fetch_us_market_universe", lambda: (calls.append("us-all"), sample_universe)[1])
+    seen_cache: list[Path | None] = []
+
+    def live_stub(universe: pd.DataFrame, throttle_s: float = 0.5, cache_dir: Path | None = None) -> fetch_data.Dataset:
+        seen_cache.append(cache_dir)
+        return _sample_live_stub(universe)
+
+    monkeypatch.setattr(screen, "fetch_live", live_stub)
+    assert screen.main(["--live", "--out", str(tmp_path / "a")]) == 0
+    assert screen.main(["--live", "--index", "us-all", "--cache-dir", str(tmp_path / "cache"), "--out", str(tmp_path / "b")]) == 0
+    assert calls == ["sp500", "us-all"]
+    assert seen_cache == [None, tmp_path / "cache"]
+    with pytest.raises(SystemExit):
+        screen.main(["--cache-dir", str(tmp_path / "cache"), "--out", str(tmp_path / "c")])
+
+
+def test_chunking_and_download_call(monkeypatch: pytest.MonkeyPatch):
+    assert [len(c) for c in fetch_data.chunked([f"T{i}" for i in range(120)], 50)] == [50, 50, 20]
+    yfinance = pytest.importorskip("yfinance")
+    seen: list[tuple[str, dict]] = []
+    monkeypatch.setattr(yfinance, "download", lambda tickers, **kwargs: (seen.append((tickers, kwargs)), pd.DataFrame())[1])
+    fetch_data.yahoo_download(["AAPL", "BRK.B", "BF.B"])
+    tickers, kwargs = seen[0]
+    assert tickers == "AAPL BRK-B BF-B"
+    assert kwargs["interval"] == "1d" and kwargs["auto_adjust"] is True and kwargs["group_by"] == "column"
+    assert kwargs["progress"] is False
+
+
+def _batch_frame(columns: dict[str, list[float]]) -> pd.DataFrame:
+    index = pd.DatetimeIndex(["2026-10-08", "2026-10-09"]).tz_localize("America/New_York")
+    data = {("Close", sym): values for sym, values in columns.items()}
+    data.update({("Open", sym): values for sym, values in columns.items()})
+    return pd.DataFrame(data, index=index)
+
+
+def test_split_batch_routes_empty_tickers_to_second_pass():
+    nan = float("nan")
+    frame = _batch_frame({"AAPL": [1.0, 2.0], "BRK-B": [3.0, 4.0], "DEAD": [nan, nan]})
+    found, missing = fetch_data.split_batch(frame, ["AAPL", "BRK.B", "DEAD", "GONE"])
+    assert sorted(found) == ["AAPL", "BRK.B"]
+    assert found["BRK.B"].tolist() == [3.0, 4.0] and found["BRK.B"].name == "BRK.B"
+    assert list(found["AAPL"].index.strftime("%Y-%m-%d")) == ["2026-10-08", "2026-10-09"] and found["AAPL"].index.tz is None
+    assert missing == ["DEAD", "GONE"]
+    assert fetch_data.split_batch(pd.DataFrame(), ["X", "Y"]) == ({}, ["X", "Y"])
+    flat = pd.DataFrame({"Close": [5.0, 6.0]}, index=pd.DatetimeIndex(["2026-10-08", "2026-10-09"]))
+    found, missing = fetch_data.split_batch(flat, ["ONLY"])
+    assert found["ONLY"].tolist() == [5.0, 6.0] and missing == []
+
+
+def test_batched_fetch_resumes_from_cache_and_falls_back(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    pd.Series([9.0, 9.5], index=pd.to_datetime(["2026-10-08", "2026-10-09"]), name="close").to_csv(
+        cache / "CACHED.csv", index_label="date")
+    requested: list[list[str]] = []
+    second: list[str] = []
+    pauses: list[float] = []
+    nan = float("nan")
+
+    def download(chunk: list[str]) -> pd.DataFrame:
+        requested.append(list(chunk))
+        if chunk[0] == "C":
+            raise ConnectionError("chunk refused")
+        return _batch_frame({t: ([nan, nan] if t == "B" else [1.0, 2.0]) for t in chunk})
+
+    def per_ticker(ticker: str) -> pd.Series:
+        second.append(ticker)
+        return pd.Series([7.0], index=pd.to_datetime(["2026-10-09"]), name=ticker)
+
+    tickers = ["A", "B", "CACHED", "C", "D", "E"]
+    prices, failures = fetch_data.fetch_prices_batched(tickers, download=download, fetch_close=per_ticker,
+                                                       throttle_s=1.0, sleep=pauses.append, cache_dir=cache, batch_size=2)
+    assert requested == [["A", "B"], ["C", "D"], ["E"]]          # CACHED was skipped
+    assert second == ["B", "C", "D"]                              # all-NaN B, and the whole failed chunk
+    assert pauses == [1.0, 2.0, 1.0, 1.0]                         # chunk pauses (doubled after the failure), then 2 per-ticker
+    assert list(prices.columns) == tickers and failures == {}
+    assert prices["CACHED"].dropna().tolist() == [9.0, 9.5]
+    assert sorted(p.stem for p in cache.glob("*.csv")) == ["A", "B", "C", "CACHED", "D", "E"]
+    err = capsys.readouterr().err
+    assert "[fetch] 1 of 6 tickers read from" in err and "[fetch] chunk 3/3: 3/6 tickers, 3 queued for retry" in err
+
+    def must_not_download(chunk: list[str]) -> pd.DataFrame:
+        raise AssertionError(f"downloaded {chunk} although every ticker is cached")
+
+    resumed, _ = fetch_data.fetch_prices_batched(tickers, download=must_not_download, fetch_close=per_ticker, cache_dir=cache)
+    assert list(resumed.columns) == tickers and resumed["B"].dropna().tolist() == [7.0]
+
+
+def test_page_uses_instanced_towers(screen_runs: tuple[Path, Path], tmp_path: Path):
+    page = scene_threejs.write_page(screen_runs[0] / "screen_result.json", tmp_path / "skyline.html").read_text()
+    assert "const towerMesh = new THREE.InstancedMesh(box, new THREE.MeshStandardMaterial(" in page
+    assert re.search(r"const hit = raycaster\.intersectObject\(towerMesh, false\)\[0\];\s*return hit \? towers\[hit\.instanceId\] : null;", page)
+    assert "raycaster.intersectObjects([towerMesh, floorHit], false)" in page
+    assert "towerMesh.setColorAt(handle.index, color);" in page and "towerMesh.instanceColor.needsUpdate = true;" in page
+    assert "towerMesh.computeBoundingSphere();" in page
+    assert "new THREE.Mesh(box" not in page
+
+
+def test_matplotlib_scales_to_thousands():
+    rows = [{"ticker": f"T{i}", "sector": ["NASDAQ", "NYSE", "NYSE American"][i % 3], "rank": i + 1,
+             "in_top": i < 20, "sr_ann": {"3y": 2.0 - i / 1000}, "t_alpha_ff3": 1.0, "alpha_ff3_ann": 0.1,
+             "alpha_capm_ann": 0.1, "t_alpha_capm": 1.0, "psr": 0.9, "dsr": 0.1, "dsr_passes": False,
+             "above_luck_plane": False, "n_obs": 756} for i in range(1500)]
+    result = {"metadata": {"windows": {"3y": 756}, "window_label": "3y", "N": 1500, "top_n": 20,
+                           "top_dsr_passing": 0, "top_above_luck_plane": 0,
+                           "luck_horizon_by_window": {"3y": {"headline": 2.5}}}, "universe": rows}
+    fig, _, stats = scene_python.build_figure(result)
+    scene_python.plt.close(fig)
+    assert stats["tower_count"] == 1500 and stats["bar_size"] == 0.55 and len(stats["labelled"]) == 10
+
+
+# --- 9. Market-scale data hygiene ------------------------------------------------------
+
+def _hygiene_dir(tmp_path: Path) -> Path:
+    """30 random names plus ZERO (one 0.0 close inside the 1y window) and FLAT (a constant price)."""
+    rng = np.random.default_rng(5)
+    dates = pd.bdate_range("2024-01-01", periods=301, name="date")
+    returns = pd.DataFrame(rng.normal(0.0005, 0.01, (300, 31)), index=dates[1:],
+                           columns=[f"N{i:02d}" for i in range(30)] + ["ZERO"])
+    prices = pd.concat([pd.DataFrame(100.0, index=dates[:1], columns=returns.columns), 100 * (1 + returns).cumprod()])
+    prices.loc[dates[200], "ZERO"] = 0.0
+    prices["FLAT"] = 100.0
+    dataset = fetch_data.Dataset(
+        universe=pd.DataFrame({"ticker": list(prices.columns), "sector": "Test"}),
+        prices=prices,
+        rf_daily=pd.Series(0.0, index=dates),
+        factors=pd.DataFrame(rng.normal(0.0, 0.01, (300, 3)), index=dates[1:], columns=["mkt_rf", "smb", "hml"]),
+        mode="test",
+    )
+    out = tmp_path / "data"
+    fetch_data.write_directory(dataset, out)
+    return out
+
+
+def test_zero_close_is_cleaned_and_name_still_screens(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    data_dir = _hygiene_dir(tmp_path)
+    dataset = fetch_data.load_directory(data_dir)
+    assert "[clean] 1 non-positive close set to missing (ZERO)" in capsys.readouterr().err
+    assert dataset.prices["ZERO"].isna().sum() == 1 and (dataset.prices.fillna(1.0) > 0).all().all()
+    result = screen.screen(dataset, window=252, top=5)
+    zero = next(r for r in result["universe"] if r["ticker"] == "ZERO")
+    assert zero["n_obs"] == 250 and zero["rank"] is not None and math.isfinite(zero["sr_ann"]["1y"])
+
+
+def test_cache_read_cleans_zero_closes(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    pd.Series([10.0, 0.0, 11.0], index=pd.to_datetime(["2026-10-07", "2026-10-08", "2026-10-09"]),
+              name="close").to_csv(cache / "DEC.csv", index_label="date")
+    prices, _ = fetch_data.fetch_prices_batched(["DEC"], download=lambda c: pd.DataFrame(), cache_dir=cache)
+    assert prices["DEC"].tolist()[:1] == [10.0] and math.isnan(prices["DEC"].tolist()[1])
+    assert "[clean] 1 non-positive close set to missing (DEC)" in capsys.readouterr().err
+
+
+def test_nonfinite_sharpe_is_excluded_from_the_plane(tmp_path: Path):
+    dataset = fetch_data.load_directory(_hygiene_dir(tmp_path))
+    result = screen.screen(dataset, window=252, top=5)
+    meta = result["metadata"]
+    assert meta["excluded_nonfinite"] == ["FLAT"]
+    assert meta["N"] == 31 and meta["universe_size"] == 32
+    assert math.isfinite(meta["luck_horizon_ann"]["headline"]) and math.isfinite(meta["luck_horizon_ann"]["cross_sectional"])
+    flat = next(r for r in result["universe"] if r["ticker"] == "FLAT")
+    assert flat["rank"] is None and flat["in_top"] is False
+
+
+def test_summary_print_survives_missing_plane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                              capsys: pytest.CaptureFixture[str]):
+    data_dir = _hygiene_dir(tmp_path)
+    assert screen.main(["--data-dir", str(data_dir), "--window", "252", "--top", "5", "--out", str(tmp_path / "a")]) == 0
+    assert re.search(r"^N=31 luck_plane_ann=\d+\.\d{3} top 5:", capsys.readouterr().out, re.M)
+    real = screen.screen
+
+    def plane_missing(*args: object, **kwargs: object) -> dict:
+        result = real(*args, **kwargs)
+        result["metadata"]["luck_horizon_ann"]["headline"] = None
+        return result
+
+    monkeypatch.setattr(screen, "screen", plane_missing)
+    assert screen.main(["--data-dir", str(data_dir), "--window", "252", "--top", "5", "--out", str(tmp_path / "b")]) == 0
+    assert "N=31 luck_plane_ann=n/a top 5:" in capsys.readouterr().out

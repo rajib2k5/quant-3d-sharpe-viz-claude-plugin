@@ -328,24 +328,34 @@ label(DATA.zero_label, "ref zero", -halfW, 0, halfD);
 const box = new THREE.BoxGeometry(DATA.tower_size, 1, DATA.tower_size);
 box.translate(0, 0.5, 0);
 const edges = new THREE.EdgesGeometry(box);
-const towers = [];
+// All towers are one InstancedMesh (one draw call at 5,000+ names). Each tower gets a light
+// handle {index, position, userData}; hover and selection rewrite that instance's colour.
+const WHITE = new THREE.Color(0xffffff);
+const towerMesh = new THREE.InstancedMesh(box, new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.1 }),
+  DATA.towers.length);
+towerMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+const baseColors = [];
+const outlineMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7 });
 const byTicker = new Map();
-for (const t of DATA.towers) {
-  const color = new THREE.Color().setRGB(...t.color, THREE.SRGBColorSpace);
+const towers = DATA.towers.map((t, index) => {
   const glow = t.rank !== null && t.rank <= DATA.label_top;
-  const material = new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.1, emissive: color.clone() });
-  const mesh = new THREE.Mesh(box, material);
-  mesh.position.set(t.x, 0, -t.y);
-  mesh.userData = { tower: t, base: glow ? 0.75 : 0 };
-  material.emissiveIntensity = mesh.userData.base;
+  const color = new THREE.Color().setRGB(...t.color, THREE.SRGBColorSpace);
+  if (glow) color.lerp(WHITE, 0.18);
+  baseColors.push(color);
+  towerMesh.setColorAt(index, color);
+  const handle = { index, position: new THREE.Vector3(t.x, 0, -t.y), userData: { tower: t, glow } };
   if (t.top) {
-    mesh.add(new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7 })));
+    handle.userData.outline = new THREE.LineSegments(edges, outlineMaterial);
+    scene.add(handle.userData.outline);
   }
-  if (glow) mesh.userData.label = label(t.ticker, "label", t.x, 0, -t.y);
-  scene.add(mesh);
-  towers.push(mesh);
-  byTicker.set(t.ticker.toUpperCase(), mesh);
-}
+  if (glow) handle.userData.label = label(t.ticker, "label", t.x, 0, -t.y);
+  byTicker.set(t.ticker.toUpperCase(), handle);
+  return handle;
+});
+scene.add(towerMesh);
+const instanceMatrix = new THREE.Matrix4();
+const unitQuaternion = new THREE.Quaternion();
+const instanceScale = new THREE.Vector3();
 for (const s of DATA.sectors) label(s.name, "sector", s.x, 0, -s.y);
 
 // Luck plane, slightly desaturated so labels stay readable through it.
@@ -377,14 +387,24 @@ scene.add(planeTick);
 const planeTickLabel = label("", "ref luck", rulerX - 1.6, 0, rulerZ);
 
 let current = DATA.window;
+let selected = null;
+let hovered = null;
 function applyWindow(w) {
   current = w;
-  for (const mesh of towers) {
-    const h = mesh.userData.tower.height[w];
-    mesh.scale.y = Math.max(Math.abs(h), 0.001);
-    mesh.position.y = h < 0 ? h : 0;
-    if (mesh.userData.label) mesh.userData.label.position.set(mesh.position.x, Math.max(h, 0) + 0.45, mesh.position.z);
+  for (const handle of towers) {
+    const h = handle.userData.tower.height[w];
+    handle.position.y = h < 0 ? h : 0;
+    instanceScale.set(1, Math.max(Math.abs(h), 0.001), 1);
+    towerMesh.setMatrixAt(handle.index, instanceMatrix.compose(handle.position, unitQuaternion, instanceScale));
+    if (handle.userData.outline) {
+      handle.userData.outline.position.copy(handle.position);
+      handle.userData.outline.scale.copy(instanceScale);
+    }
+    if (handle.userData.label) handle.userData.label.position.set(handle.position.x, Math.max(h, 0) + 0.45, handle.position.z);
   }
+  towerMesh.instanceMatrix.needsUpdate = true;
+  towerMesh.computeBoundingSphere();
+  if (selected) placeCage(selected);
   const planeY = DATA.luck_height[w];
   luck.position.y = planeY;
   luckLabel.position.y = planeY;
@@ -428,12 +448,16 @@ for (const s of [1.08, 1.16]) {
   cage.scale.set(s, 1.0, s);
   selectionCage.add(cage);
 }
-let selected = null;
-let hovered = null;
-
-function setGlow(mesh) {
-  const boost = mesh === selected ? 1.4 : mesh === hovered ? Math.max(mesh.userData.base, 0.45) : mesh.userData.base;
-  mesh.material.emissiveIntensity = boost;
+function setGlow(handle) {
+  const color = baseColors[handle.index].clone();
+  if (handle === selected) color.lerp(WHITE, 0.5);
+  else if (handle === hovered) color.lerp(WHITE, 0.3);
+  towerMesh.setColorAt(handle.index, color);
+  towerMesh.instanceColor.needsUpdate = true;
+}
+function placeCage(handle) {
+  selectionCage.position.copy(handle.position);
+  selectionCage.scale.set(1, Math.max(Math.abs(handle.userData.tower.height[current]), 0.001), 1);
 }
 function field(name, value) {
   const dt = document.createElement("dt");
@@ -455,9 +479,10 @@ function rowJson(t) {
 function select(mesh, moveCamera) {
   const previous = selected;
   selected = mesh;
-  if (previous) { previous.remove(selectionCage); setGlow(previous); }
+  if (previous) setGlow(previous);
   setGlow(mesh);
-  mesh.add(selectionCage);
+  placeCage(mesh);
+  scene.add(selectionCage);
   const t = mesh.userData.tower;
   document.getElementById("d-ticker").textContent = t.ticker;
   document.getElementById("d-sector").textContent = t.sector;
@@ -492,7 +517,7 @@ function clearSelection() {
   if (!selected) return;
   const mesh = selected;
   selected = null;
-  mesh.remove(selectionCage);
+  scene.remove(selectionCage);
   setGlow(mesh);
   details.hidden = true;
   for (const row of document.querySelectorAll("#toplist button")) row.setAttribute("aria-current", "false");
@@ -598,10 +623,16 @@ const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 function towerAt(event) {
   aim(event);
-  const hit = raycaster.intersectObjects(towers, false)[0];
-  return hit ? hit.object : null;
+  const hit = raycaster.intersectObject(towerMesh, false)[0];
+  return hit ? towers[hit.instanceId] : null;
 }
+// Hover picking runs at most once per frame, however fast the pointer events arrive.
+let pendingHover = null;
 renderer.domElement.addEventListener("pointermove", (event) => {
+  if (pendingHover === null) requestAnimationFrame(() => { updateHover(pendingHover); pendingHover = null; });
+  pendingHover = event;
+});
+function updateHover(event) {
   const mesh = towerAt(event);
   if (mesh !== hovered) {
     const previous = hovered;
@@ -628,7 +659,7 @@ renderer.domElement.addEventListener("pointermove", (event) => {
   tooltip.style.display = "block";
   tooltip.style.left = `${Math.min(event.clientX + 14, window.innerWidth - tooltip.offsetWidth - 8)}px`;
   tooltip.style.top = `${Math.min(event.clientY + 14, window.innerHeight - tooltip.offsetHeight - 8)}px`;
-});
+}
 // A click is a press and release without dragging. A left press on the floor starts a
 // map-style drag that keeps the grabbed ground point under the cursor; any other drag is
 // OrbitControls' (left orbits, right pans parallel to the ground, wheel zooms, touch gestures).
@@ -642,7 +673,7 @@ function aim(event) {
 }
 function hitKind(event) {
   aim(event);
-  const hit = raycaster.intersectObjects([...towers, floorHit], false)[0];
+  const hit = raycaster.intersectObjects([towerMesh, floorHit], false)[0];
   if (!hit) return null;
   return hit.object === floorHit ? "floor" : "tower";
 }
